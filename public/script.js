@@ -43,6 +43,7 @@ function tryConnect() {
     ws = c;
 
     hideError();
+    $('#notifications').empty();
     tryTokenAuth();
     updateNetact(true);
   });
@@ -278,7 +279,7 @@ $('#softwareUpdate').click(function() {
   const msg = 'Are you sure you want to start a software update? ' +
               'This may take several minutes. ' +
               'You won\'t be able to start a stream until it\'s completed. ' +
-              'The encoder will briefly disconnect after a succesful upgrade. ' +
+              'The encoder will briefly disconnect after a successful upgrade. ' +
               'Never remove power or reset the encoder while updating. If the encoder is powered from a battery, ensure it\'s fully charged.';
 
   if (confirm(msg)) {
@@ -307,7 +308,7 @@ function showSshStatus(s) {
     $('#stopSsh').addClass('d-none');
     $('#startSsh').removeClass('d-none');
   }
-  $('#advancedSettings').removeClass('d-none');
+  $('#sshSettings').removeClass('d-none');
 }
 
 $('#resetSshPass').click(function() {
@@ -317,6 +318,60 @@ $('#resetSshPass').click(function() {
     send_command('reset_ssh_pass');
   }
 });
+
+
+/* Audio device / codec selection */
+let audioSrcList = [];
+function updateAudioSrcs(list) {
+  if (list !== null) {
+    audioSrcList = list;
+  }
+
+  const audioSelect = document.getElementById("audioSource");
+  audioSelect.innerText = null;
+  let asrcFound = false;
+
+  for (const card of audioSrcList) {
+    const option = document.createElement("option");
+    option.value = card;
+    option.innerText = card;
+
+    audioSelect.append(option);
+    if (config.asrc && card == config.asrc) {
+      option.selected = true;
+      asrcFound = true;
+    }
+  }
+
+  if (config.asrc && !asrcFound) {
+    const option = document.createElement("option");
+    option.innerText = config.asrc + " (unavailable)";
+    option.value = config.asrc;
+    option.selected = true;
+    audioSelect.append(option);
+  }
+}
+
+let audioCodecList = {};
+function updateAudioCodecs(list) {
+  if (list !== null) {
+    audioCodecList = list;
+  }
+
+  const audioCodec = document.getElementById("audioCodec");
+  audioCodec.innerText = null;
+
+  for (const codec in audioCodecList) {
+    const option = document.createElement("option");
+    option.value = codec;
+    option.innerText = audioCodecList[codec];
+
+    if (config.acodec && codec == config.acodec) {
+      option.selected = true;
+    }
+    audioCodec.append(option);
+  }
+}
 
 
 /* status updates */
@@ -365,6 +420,10 @@ function updateStatus(status) {
   if (status.wifi) {
     updateWifiState(status.wifi);
   }
+
+  if (status.asrcs) {
+    updateAudioSrcs(status.asrcs);
+  }
 }
 
 
@@ -376,9 +435,12 @@ function loadConfig(c) {
   initDelaySlider(config.delay ?? 0);
   initSrtLatencySlider(config.srt_latency ?? 2000);
   updatePipelines(null);
+  updateAudioSrcs(null);
 
+  const srtlaAddr = config.srtla_addr ?? "";
+  showHideRelayHint(srtlaAddr);
+  document.getElementById("srtlaAddr").value = srtlaAddr;
   document.getElementById("srtStreamid").value = config.srt_streamid ?? "";
-  document.getElementById("srtlaAddr").value = config.srtla_addr ?? "";
   document.getElementById("srtlaPort").value = config.srtla_port ?? "";
 
   $('#remoteDeviceKey').val(config.remote_key);
@@ -392,6 +454,7 @@ function loadConfig(c) {
 
 
 /* Pipelines */
+let pipelines = {};
 function updatePipelines(ps) {
   if (ps != null) {
     pipelines = ps;
@@ -403,15 +466,36 @@ function updatePipelines(ps) {
   for (const id in pipelines) {
     const option = document.createElement("option");
     option.value = id;
-    option.innerText = pipelines[id];
+    option.innerText = pipelines[id].name;
     if (config.pipeline && config.pipeline == id) {
       option.selected = true;
     }
 
     pipelinesSelect.append(option);
   }
+  pipelineSelectHandler(pipelinesSelect);
 }
 
+function pipelineSelectHandler(s) {
+  const p = pipelines[s.value];
+  if (!p) return;
+
+  if (p.asrc) {
+    $('#selectAudioSource').removeClass('d-none');
+  } else {
+    $('#selectAudioSource').addClass('d-none');
+  }
+
+  if (p.acodec) {
+    $('#selectAudioCodec').removeClass('d-none');
+  } else {
+    $('#selectAudioCodec').addClass('d-none');
+  }
+}
+
+$("#pipelines").change(function(ev) {
+  pipelineSelectHandler(ev.target);
+});
 
 /* Bitrate setting updates */
 function updateBitrate(br) {
@@ -870,6 +954,19 @@ function handleNotification(msg) {
 }
 
 
+/* Log download */
+function downloadLog(msg) {
+  const blob = new Blob([msg.contents], {type: 'text/plain'})
+
+  const a = window.document.createElement('a');
+  a.href = window.URL.createObjectURL(blob);
+  a.download = msg.name;
+  a.click();
+
+  window.URL.revokeObjectURL(blob);
+}
+
+
 /* Handle server-to-client messages */
 function handleMessage(msg) {
   console.log(msg);
@@ -908,6 +1005,12 @@ function handleMessage(msg) {
       case 'notification':
         handleNotification(msg[type]);
         break;
+      case 'log':
+        downloadLog(msg[type]);
+        break;
+      case 'acodecs':
+        updateAudioCodecs(msg[type]);
+        break;
     }
   }
 }
@@ -919,6 +1022,12 @@ function getConfig() {
 
   let config = {};
   config.pipeline = document.getElementById("pipelines").value;
+  if (pipelines[config.pipeline].asrc) {
+    config.asrc = document.getElementById("audioSource").value;
+  }
+  if (pipelines[config.pipeline].acodec) {
+    config.acodec = document.getElementById("audioCodec").value;
+  }
   config.delay = $("#delaySlider").slider("value");
   config.max_br = maxBr;
   config.srtla_addr = document.getElementById("srtlaAddr").value;
@@ -1047,6 +1156,7 @@ document.getElementById("startStop").addEventListener("click", () => {
     updateButton({text: "Starting..."});
     start();
   } else {
+    updateButton({text: "Stopping..."});
     stop();
   }
 });
@@ -1155,9 +1265,12 @@ $('#logout').click(function() {
 });
 
 $('.command-btn').click(function() {
-  // convert to snake case
-  const cmd = this.id.split(/(?=[A-Z])/).join('_').toLowerCase();
-  send_command(cmd);
+  const confirmationMsg = $(this).attr('data-confirmation');
+  if (!confirmationMsg || confirm(confirmationMsg)) {
+    // convert to snake case
+    const cmd = this.id.split(/(?=[A-Z])/).join('_').toLowerCase();
+    send_command(cmd);
+  }
 });
 
 $('button.showHidePassword').click(function() {
@@ -1169,6 +1282,19 @@ $('button.showHidePassword').click(function() {
     inputField.attr('type', 'password');
     $(this).text('Show');
   }
+});
+
+function showHideRelayHint(addr) {
+  const isCloudRelay = addr.match(/belabox.net$/);
+  if (isCloudRelay) {
+    $('#cloudRelay').addClass('d-none');
+  } else {
+    $('#cloudRelay').removeClass('d-none');
+  }
+}
+
+$('input#srtlaAddr').change(function() {
+  showHideRelayHint($(this).val());
 });
 
 /* Input fields automatically copied to clipboard when clicked */
