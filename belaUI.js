@@ -1910,7 +1910,11 @@ function startError(conn, msg, id = undefined) {
   if (id !== undefined) {
     conn.senderId = originalId;
   }
-  conn.send(buildMsg('status', {is_streaming: false}));
+
+  if (!updateStatus(false)) {
+    conn.send(buildMsg('status', {is_streaming: false}));
+  }
+
   return false;
 }
 
@@ -1942,16 +1946,81 @@ async function removeBitrateOverlay(pipelineFile) {
   return pipelineTmp;
 }
 
-let updateConfigTimer;
+async function resolveSrtla(addr, conn) {
+  let srtlaAddr = addr;
+  try {
+    var {addrs, fromCache} = await dnsCacheResolve(addr, 'a');
+  } catch (err) {
+    startError(conn, "failed to resolve SRTLA addr " + addr, conn.senderId);
+    queueUpdateGw();
+    return;
+  }
+
+  if (fromCache) {
+    srtlaAddr = addrs[Math.floor(Math.random()*addrs.length)];
+    queueUpdateGw();
+  } else {
+    /* At the moment we don't check that the SRTLA connection was established before
+       validating the DNS result. The caching DNS resolver checks for invalid
+       results from captive portals, etc, so all results *should* be good already */
+    dnsCacheValidate(addr);
+  }
+
+  return srtlaAddr;
+}
+
+function asrcProbe(asrc) {
+  audioSrcId = audioDevices[asrc];
+  if (!audioSrcId) {
+    const msg = `Selected audio input '${config.asrc}' is unavailable. Waiting for it before starting the stream...`;
+    notificationBroadcast('asrc_not_found', 'warning', msg, 2, true, false);
+  }
+
+  return audioSrcId;
+}
+
+async function pipelineSetAsrc(pipelineFile, audioSrcId, audioCodec) {
+  pipelineFile = await replaceAudioSettings(pipelineFile, audioSrcId, audioCodec);
+  if (!pipelineFile) {
+    startError(conn, 'failed to generate the pipeline file - audio settings');
+  }
+  return pipelineFile;
+}
+
+let asrcRetryTimer;
+function asrcScheduleRetry(pipelineFile, callback, conn) {
+  asrcRetryTimer = setTimeout(function() {
+    asrcRetry(pipelineFile, callback, conn);
+  }, 1000);
+}
+
+async function asrcRetry(pipelineFile, callback, conn) {
+  asrcRetryTimer = undefined;
+
+  audioSrcId = asrcProbe(config.asrc);
+  if (audioSrcId) {
+    pipelineFile = await pipelineSetAsrc(pipelineFile, audioSrcId, config.acodec);
+    if (!pipelineFile) return;
+
+    let srtlaAddr = await resolveSrtla(config.srtla_addr, conn);
+    if (!srtlaAddr) return;
+
+    callback(pipelineFile, srtlaAddr);
+  } else {
+    asrcScheduleRetry(pipelineFile, callback, conn);
+  }
+}
 
 async function updateConfig(conn, params, callback) {
-  updateConfigTimer = undefined;
+  asrcRetryTimer = undefined;
 
   // delay
   if (params.delay == undefined)
     return startError(conn, "audio delay not specified");
-  if (params.delay < -2000 || params.delay > 2000)
-    return startError(conn, "invalid delay " + params.delay);
+  const delayTmp = parseInt(params.delay);
+  if (delayTmp != params.delay || delayTmp < -2000 || delayTmp > 2000)
+    return startError(conn, `invalid delay '${params.delay}'`);
+  params.delay = delayTmp;
 
   // pipeline
   if (params.pipeline == undefined)
@@ -1987,8 +2056,10 @@ async function updateConfig(conn, params, callback) {
   // srt latency
   if (params.srt_latency == undefined)
     return startError(conn, "SRT latency not specified");
-  if (params.srt_latency < 100 || params.srt_latency > 10000)
-    return startError(conn, "invalid SRT latency " + params.srt_latency + " ms");
+  const latencyTmp = parseInt(params.srt_latency);
+  if (latencyTmp != params.srt_latency || latencyTmp < 100 || latencyTmp > 10000)
+    return startError(conn, `invalid SRT latency '${params.srt_latency}' ms`);
+  params.srt_latency = latencyTmp;
 
   // srt streamid
   if (params.srt_streamid == undefined)
@@ -1997,10 +2068,17 @@ async function updateConfig(conn, params, callback) {
   // srtla addr & port
   if (params.srtla_addr == undefined)
     return startError(conn, "SRTLA address not specified");
+  params.srtla_addr = params.srtla_addr.trim();
   if (params.srtla_port == undefined)
     return startError(conn, "SRTLA port not specified");
-  if (params.srtla_port <= 0 || params.srtla_port > 0xFFFF)
-    return startError(conn, "invalid SRTLA port " + params.srtla_port);
+  const portTmp = parseInt(params.srtla_port);
+  if (portTmp != params.srtla_port || portTmp <= 0 || portTmp > 0xFFFF)
+    return startError(conn, `invalid SRTLA port '${params.srtla_port}'`);
+  params.srtla_port = portTmp;
+
+  // resolve the srtla hostname
+  let srtlaAddr = await resolveSrtla(params.srtla_addr, conn);
+  if (!srtlaAddr) return;
 
   // audio capture device, if needed for the pipeline
   let audioSrcId = defaultAudioId;
@@ -2008,49 +2086,13 @@ async function updateConfig(conn, params, callback) {
     if (params.asrc == undefined) {
       return startError(conn, "audio source not specified");
     }
+
     audioSrcId = audioDevices[params.asrc];
     if (!audioSrcId && params.asrc != config.asrc) {
       return startError(conn, "selected audio source not found");
     }
 
-    /* If the audio device is missing, then recheck every second or
-       until the stream is stopped
-       Case only reachable if the previously used audio source was
-       selected, but it's not currently available */
-    if (!audioSrcId) {
-      const msg = `Selected audio input '${config.asrc}' is unavailable. Waiting for it before starting the stream...`;
-      notificationBroadcast('asrc_not_found', 'warning', msg, 2, true, false);
-
-      updateConfigTimer = setTimeout(function() {
-        updateConfig(conn, params, callback);
-      }, 1000);
-      return;
-    }
-  }
-
-  // resolve the srtla hostname
-  let srtlaAddr = params.srtla_addr;
-  try {
-    var {addrs, fromCache} = await dnsCacheResolve(params.srtla_addr, 'a');
-  } catch (err) {
-    startError(conn, "failed to resolve SRTLA addr " + params.srtla_addr, conn.senderId);
-    queueUpdateGw();
-    return;
-  }
-
-  if (fromCache) {
-    srtlaAddr = addrs[Math.floor(Math.random()*addrs.length)];
-    queueUpdateGw();
-  } else {
-    /* At the moment we don't check that the SRTLA connection was established before
-       validating the DNS result. The caching DNS resolver checks for invalid
-       results from captive portals, etc, so all results *should* be good already */
-    dnsCacheValidate(params.srtla_addr);
-  }
-
-  pipelineFile = await replaceAudioSettings(pipelineFile, audioSrcId, audioCodec);
-  if (!pipelineFile) {
-    return startError(conn, 'failed to generate the pipeline file - audio settings');
+    audioSrcId = asrcProbe(params.asrc);
   }
 
   if (pipeline.asrc) {
@@ -2074,13 +2116,25 @@ async function updateConfig(conn, params, callback) {
 
   broadcastMsg('config', config);
 
-  callback(pipelineFile, srtlaAddr);
+  if (audioSrcId) {
+    pipelineFile = await pipelineSetAsrc(pipelineFile, audioSrcId, audioCodec);
+    if (!pipelineFile) return;
+
+    callback(pipelineFile, srtlaAddr);
+  } else {
+    asrcScheduleRetry(pipelineFile, callback, conn);
+    updateStatus(true);
+  }
 }
 
 let isStreaming = false;
 function updateStatus(status) {
-  isStreaming = status;
-  broadcastMsg('status', {is_streaming: isStreaming});
+  if (status != isStreaming) {
+    isStreaming = status;
+    broadcastMsg('status', {is_streaming: isStreaming});
+    return true;
+  }
+  return false;
 }
 
 function genSrtlaIpList() {
@@ -2133,12 +2187,12 @@ function start(conn, params) {
   }
 
   const senderId = conn.senderId;
-  updateStatus(true);
   updateConfig(conn, params, function(pipeline, srtlaAddr) {
     if (genSrtlaIpList() < 1) {
       startError(conn, "Failed to start, no available network connections", senderId);
       return;
     }
+    updateStatus(true);
 
     spawnStreamingLoop(srtlaSendExec, [
                          9000,
@@ -2235,9 +2289,9 @@ function stopAll() {
 }
 
 function stop() {
-  if (updateConfigTimer) {
-    clearTimeout(updateConfigTimer);
-    updateConfigTimer = undefined;
+  if (asrcRetryTimer) {
+    clearTimeout(asrcRetryTimer);
+    asrcRetryTimer = undefined;
 
     if (streamingProcesses.length == 0) {
       updateStatus(false);

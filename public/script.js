@@ -20,6 +20,53 @@ let config = {};
 
 let ws = null;
 
+function getThemeSetting() {
+  return $('#themeSelector>select').val();
+}
+
+function updateTheme(theme) {
+  if (!theme) {
+    theme = getThemeSetting();
+  }
+
+  if (theme == 'auto') {
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      theme = 'dark';
+    }
+  }
+
+  if (theme == 'dark') {
+    $('body').addClass('dark');
+  } else {
+    $('body').removeClass('dark');
+  }
+}
+
+// Load the persistent setting, if available
+function loadThemeSetting() {
+  const s = localStorage.getItem('theme');
+  if (s) {
+    $('#themeSelector>select').val(s);
+  }
+  updateTheme();
+}
+loadThemeSetting();
+
+// Update the theme if the selector is changed
+$('#themeSelector>select').change(function () {
+  const s = getThemeSetting();
+  localStorage.setItem('theme', s);
+  updateTheme(s);
+});
+
+// Update the theme if the system preference changes
+if (window.matchMedia) {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function() {
+    updateTheme();
+  });
+}
+
+
 function tryConnect() {
   let wsProtocol = 'ws://';
   if (window.location.protocol === 'https:') {
@@ -87,6 +134,7 @@ function handleAuthResult(msg) {
     hideError();
     $('#notifications').empty();
     $('#main').removeClass('d-none');
+    $('#themeSelector').removeClass('d-none');
   } else if (!isShowingInitialPasswordForm) {
     showLoginForm();
   }
@@ -1177,6 +1225,7 @@ function showLoginForm() {
   $('#main').addClass('d-none');
   $('#initialPasswordForm').addClass('d-none');
   $('#login').removeClass('d-none');
+  $('#themeSelector').removeClass('d-none');
 }
 
 function sendAuthMsg(password, isPersistent) {
@@ -1199,6 +1248,7 @@ function showInitialPasswordForm() {
   $('#main').addClass('d-none');
   $('#login').addClass('d-none');
   $('#initialPasswordForm').removeClass('d-none');
+  $('#themeSelector').removeClass('d-none');
   isShowingInitialPasswordForm = true;
 }
 
