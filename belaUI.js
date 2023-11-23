@@ -112,15 +112,28 @@ try {
 console.log(revisions);
 
 let config;
+let passwordHash;
 let sshPasswordHash;
 try {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   console.log(config);
+  passwordHash = config.password_hash;
   sshPasswordHash = config.ssh_pass_hash;
+  delete config.password_hash;
   delete config.ssh_pass_hash;
 } catch (err) {
   console.log(`Failed to open the config file: ${err.message}. Creating an empty config`);
   config = {};
+
+  // Configure the default audio source depending on the platform
+  switch (setup.hw) {
+    case 'jetson':
+      config.asrc = fs.existsSync('/dev/hdmi_capture') ? 'HDMI' : 'C4K';
+      break;
+    case 'rk3588':
+      config.asrc = fs.existsSync('/dev/hdmirx') ? 'HDMI' : 'USB audio';
+      break;
+  }
 }
 
 
@@ -135,8 +148,10 @@ try {
 }
 
 function saveConfig() {
+  config.password_hash = passwordHash;
   config.ssh_pass_hash = sshPasswordHash;
   const c = JSON.stringify(config);
+  delete config.password_hash;
   delete config.ssh_pass_hash;
   fs.writeFileSync(CONFIG_FILE, c);
 }
@@ -158,7 +173,7 @@ const wss = new ws.Server({ server });
 wss.on('connection', function connection(conn) {
   conn.lastActive = getms();
 
-  if (!config.password_hash) {
+  if (!passwordHash) {
     conn.send(buildMsg('status', {set_password: true}));
   }
   notificationSendPersistent(conn, false);
@@ -244,7 +259,7 @@ function broadcastMsgExcept(conn, type, data) {
 
 
 /* Read the list of pipeline files */
-function readDirAbsPath(dir) {
+function readDirAbsPath(dir, excludePattern) {
   const pipelines = {};
 
   try {
@@ -253,6 +268,8 @@ function readDirAbsPath(dir) {
 
     for (const f in files) {
       const name = basename + '/' + files[f];
+      if (excludePattern && name.match(excludePattern)) continue;
+
       const id = crypto.createHash('sha1').update(name).digest('hex');
       const path = dir + files[f];
       pipelines[id] = {name: name, path: path};
@@ -268,9 +285,14 @@ function readDirAbsPath(dir) {
 async function getPipelines() {
   const ps = {};
   Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
-  if (setup['hw'] == 'jetson') {
-    Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/jetson/'));
+
+  // Get the hardware-specific pipelines
+  let excludePipelines;
+  if (setup.hw == 'rk3588' && !fs.existsSync('/dev/hdmirx')) {
+    excludePipelines = 'h265_hdmi';
   }
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + `/${setup.hw}/`, excludePipelines));
+
   Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/generic/'));
 
   for (const p in ps) {
@@ -330,20 +352,21 @@ function updateNetif() {
         let inetAddr = int.match(/inet (\d+\.\d+\.\d+\.\d+)/);
         if (inetAddr) inetAddr = inetAddr[1];
 
+        const flags = int.match(/flags=\d+<([A-Z,]+)>/)[1].split(',');
+        const isRunning = flags.includes('RUNNING');
+
         // update the list of WiFi devices
         if (name && name.match('^wlan')) {
           let hwAddr = int.match(/ether ([0-9a-f:]+)/);
           if (hwAddr) {
-            wiFiDeviceListAdd(name, hwAddr[1], inetAddr);
+            wiFiDeviceListAdd(name, hwAddr[1], isRunning ? inetAddr : null);
           }
         }
 
         if (name == 'lo' || name.match('^docker') || name.match('^l4tbr')) continue;
 
         if (!inetAddr) continue;
-
-        const flags = int.match(/flags=\d+<([A-Z,]+)>/)[1].split(',');
-        if (!flags.includes('RUNNING')) continue;
+        if (!isRunning) continue;
 
         let txBytes = int.match(/TX packets \d+  bytes \d+/);
         txBytes = parseInt(txBytes[0].split(' ').pop());
@@ -872,9 +895,15 @@ function wiFiDeviceListEndUpdate() {
   return wiFiDeviceListIsModified;
 }
 
-function wifiDeviceListGetAddr(ifname) {
+function wifiDeviceListGetHwAddr(ifname) {
   if (wifiDeviceHwAddr[ifname]) {
     return wifiDeviceHwAddr[ifname].hwAddr;
+  }
+}
+
+function wifiDeviceListGetInetAddr(ifname) {
+  if (wifiDeviceHwAddr[ifname]) {
+    return wifiDeviceHwAddr[ifname].inetAddr;
   }
 }
 
@@ -912,6 +941,30 @@ function nmConnGetFields(uuid, fields) {
   } catch ({message}) {
     console.log(`nmConnGetFields err: ${message}`);
   }
+}
+
+function nmConnSetWifiMac(uuid, mac, callback) {
+  const args = [
+    "con",
+    "modify",
+    uuid,
+    "connection.interface-name",
+    "",
+    "802-11-wireless.mac-address",
+    mac
+  ];
+
+  execFile("nmcli", args, function(error, stdout, stderr) {
+    let success = true;
+    if (error || stdout != "") {
+      console.log(`nmConnSetWifiMac err: ${stdout} ${stderr}`);
+      success = false;
+    }
+
+    if (callback) {
+      callback(success);
+    }
+  });
 }
 
 function nmConnDelete(uuid, callback) {
@@ -1121,7 +1174,7 @@ function wifiUpdateScanResult() {
 
     if (ssid == null || ssid == "") continue;
 
-    const hwAddr = wifiDeviceListGetAddr(device);
+    const hwAddr = wifiDeviceListGetHwAddr(device);
     if (!wifiIfs[hwAddr] || (active != 'yes' && wifiIfs[hwAddr].available.has(ssid))) continue;
 
     wifiIfs[hwAddr].available.set(ssid, {
@@ -1147,6 +1200,8 @@ function wifiScheduleScanUpdates() {
   setTimeout(wifiUpdateScanResult, 3000);
   setTimeout(wifiUpdateScanResult, 5000);
   setTimeout(wifiUpdateScanResult, 10000);
+  setTimeout(wifiUpdateScanResult, 15000);
+  setTimeout(wifiUpdateScanResult, 20000);
 }
 
 let unavailableDeviceRetryExpiry = 0;
@@ -1172,7 +1227,6 @@ function wifiUpdateDevices() {
   for (const networkDevice of networkDevices) {
     try {
       const [ifname, type, state, connUuid] = nmcliParseSep(networkDevice);
-      const conn = (connUuid != '') ? connUuid : null;
 
       if (type !== "wifi") continue;
       if (state == "unavailable") {
@@ -1180,7 +1234,8 @@ function wifiUpdateDevices() {
         continue;
       }
 
-      const hwAddr = wifiDeviceListGetAddr(ifname);
+      const conn = (connUuid != '' && wifiDeviceListGetInetAddr(ifname)) ? connUuid : null;
+      const hwAddr = wifiDeviceListGetHwAddr(ifname);
       if (!hwAddr) continue;
 
       if (wifiIfs[hwAddr]) {
@@ -1228,6 +1283,7 @@ function wifiUpdateDevices() {
   }
   if (statusChange) {
     wifiUpdateScanResult();
+    wifiScheduleScanUpdates();
   }
   if (newDevices || statusChange) {
     wifiBroadcastState();
@@ -1315,9 +1371,11 @@ function wifiDeleteFailedConns() {
 
 function wifiNew(conn, msg) {
   if (!msg.device || !msg.ssid) return;
-  if (!wifiIdToHwAddr[msg.device]) return;
 
-  const device = wifiIfs[wifiIdToHwAddr[msg.device]].ifname;
+  const mac = wifiIdToHwAddr[msg.device];
+  if (!mac) return;
+
+  const device = wifiIfs[mac].ifname;
 
   const args = [
     "-w",
@@ -1345,11 +1403,23 @@ function wifiNew(conn, msg) {
       } else {
         conn.send(buildMsg('wifi', {new: {error: "generic", device: msg.device}}, senderId));
       }
-    } else if (stdout.match('successfully activated')) {
-      wifiUpdateSavedConns();
-      wifiUpdateScanResult();
+    } else {
+      const success = stdout.match(/successfully activated with '(.+)'/);
+      if (success) {
+        const uuid = success[1];
+        nmConnSetWifiMac(uuid, mac, function(success) {
+          if (!success) {
+            console.log("Failed to set the MAC address for the newly created connection");
+          }
 
-      conn.send(buildMsg('wifi', {new: {success: true, device: msg.device}}, senderId));
+          wifiUpdateSavedConns();
+          wifiUpdateScanResult();
+
+          conn.send(buildMsg('wifi', {new: {success: true, device: msg.device}}, senderId));
+        });
+      } else {
+        console.log(`wifiNew: no error but not matching a successful connection msg in:\n${stdout}\n${stderr}`);
+      }
     }
   });
 }
@@ -1662,6 +1732,16 @@ function notificationSendPersistent(conn, isAuthed = false) {
 
 /* Hardware monitoring */
 let sensors = {};
+
+function updateSensorThermal(id, name) {
+  try {
+    let socTemp = fs.readFileSync(`/sys/class/thermal/thermal_zone${id}/temp`, 'utf8');
+    socTemp = parseInt(socTemp) / 1000.0;
+    socTemp = `${socTemp.toFixed(1)} °C`;
+    sensors[name] = socTemp;
+  } catch (err) {};
+}
+
 function updateSensorsJetson() {
   try {
     let socVoltage = fs.readFileSync('/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0/in_voltage0_input', 'utf8');
@@ -1677,18 +1757,33 @@ function updateSensorsJetson() {
     sensors['SoC current'] = socCurrent;
   } catch(err) {};
 
-  try {
-    let socTemp = fs.readFileSync('/sys/class/thermal/thermal_zone0/temp', 'utf8');
-    socTemp = parseInt(socTemp) / 1000.0;
-    socTemp = `${socTemp.toFixed(1)} °C`;
-    sensors['SoC temperature'] = socTemp;
-  } catch (err) {};
+  updateSensorThermal(0, 'SoC temperature');
+}
 
+function updateSensorsRk3588() {
+  updateSensorThermal(0, 'SoC temperature');
+}
+
+function updateSensors() {
+  sensorsFunc();
   broadcastMsg('sensors', sensors, getms() - ACTIVE_TO);
 }
-if (setup['hw'] == 'jetson') {
-  updateSensorsJetson();
-  setInterval(updateSensorsJetson, 1000);
+
+let sensorsFunc;
+switch (setup.hw) {
+  case 'jetson':
+    sensorsFunc = updateSensorsJetson;
+    break;
+  case 'rk3588':
+    sensorsFunc = updateSensorsRk3588;
+    break;
+  default:
+    console.log(`Unknown sensors for ${setup.hw}`);
+}
+
+if (sensorsFunc) {
+  updateSensors();
+  setInterval(updateSensors, 1000);
 }
 
 async function isServiceEnabled(service) {
@@ -1720,23 +1815,48 @@ async function monitorBootconfig() {
   }
 }
 
-if (setup.hw == 'jetson') {
-  /* Monitor the kernel log for undervoltage events */
-  const dmesg = spawn("dmesg", ["-w"]);
+/* Hardware-specific monitoring */
+switch (setup.hw) {
+  case 'jetson': {
+    /* Monitor the kernel log for undervoltage events */
+    const dmesg = spawn("dmesg", ["-w"]);
+    dmesg.stdout.on('data', function(data) {
+      if (data.toString('utf8').match('soctherm: OC ALARM 0x00000001')) {
+        const msg = 'System undervoltage detected. ' +
+                    'You may experience system instability, ' +
+                    'including glitching, freezes and the modems disconnecting';
+        notificationBroadcast('jetson_undervoltage', 'error', msg, 10*60, true, false);
+      }
+    }); // dmesg
 
-  dmesg.stdout.on('data', function(data) {
-    if (data.toString('utf8').match('soctherm: OC ALARM 0x00000001')) {
-      const msg = 'System undervoltage detected. ' +
-                  'You may experience system instability, ' +
-                  'including glitching, freezes and the modems disconnecting';
-      notificationBroadcast('jetson_undervoltage', 'error', msg, 10*60, true, false);
-    }
-  });
+    /* Show an alert while belabox-firstboot-bootconfig is active */
+    monitorBootconfig();
+    break;
+  }
 
-  /* Show an alert while belabox-firstboot-bootconfig is active */
-  monitorBootconfig();
+  case 'rk3588': {
+    const dmesg = spawn("dmesg", ["-w"]);
+    dmesg.stdout.on('data', function(data) {
+      data = data.toString('utf8');
+      if (data.match('hdmirx_wait_lock_and_get_timing signal not lock') ||
+          data.match('hdmirx_delayed_work_audio: audio underflow')) {
+        const msg = 'HDMI signal issues detected. This is usually caused either by EMI or a by a faulty cable. ' +
+                    'Try to move any modems away from the HDMI cable and the encoder. ' +
+                    'If that fails, try out a different HDMI cable or to manually set a lower HDMI resolution/framerate on your camera';
+        notificationBroadcast('hdmi_error', 'error', msg, 8, true, false);
+      }
+      if (data.match('hdmirx-controller: Err, timing is invalid')) {
+        const hdmiNotif = notificationExists('hdmi_error');
+        const msg = 'No HDMI signal detected';
+
+        if (!hdmiNotif || hdmiNotif.msg == msg) {
+          notificationBroadcast('hdmi_error', 'error', msg, 3, true, false);
+        }
+      }
+    });
+    break;
+  }
 }
-
 
 /* Check if there are any Cam Links plugged into a USB2 port */
 async function checkCamlinkUsb2() {
@@ -1750,12 +1870,16 @@ async function checkCamlinkUsb2() {
       if (vendor != "0fd9\n") continue;
 
       /*
-        With my unit it would appear that product ID 0x66 is used for USB3.0 and
-        0x67 is used for USB2.0, but I'm not sure if this is consistent between
-        different revisions. So we'll check bcdUSB (aka version) for both
+        With my 20GAM9901 unit it would appear that product ID 0x66 is used for
+        USB3.0 and 0x67 is used for USB2.0, but I'm not sure if this is consistent
+        between different revisions. So we'll check bcdUSB (aka version) for both
+
+        Additional product IDs for 20GAM9902 thanks to chubbybunny627: 0x7b for
+        USB 3.0 and 0x85 for USB 2.0
       */
-      const product = await readTextFile(`${deviceDir}/${d}/idProduct`);
-      if (product != "0066\n" && product != "0067\n") continue;
+      const product = (await readTextFile(`${deviceDir}/${d}/idProduct`)).trim();
+      const knownCamLinkPids = ['0066', '0067', '007b', '0085'];
+      if (!knownCamLinkPids.includes(product)) continue;
 
       const version = await readTextFile(`${deviceDir}/${d}/version`);
       if (!version.match('3.00')) {
@@ -1778,15 +1902,15 @@ checkCamlinkUsb2();
 
 
 /* Audio input selection and codec */
-const alsaSrcPattern = /alsasrc device=[A-Za-z0-9:]+/;
+const alsaSrcPattern = /alsasrc device=[A-Za-z0-9:=]+/;
 const alsaPipelinePattern = /alsasrc device=[A-Za-z0-9:]+(.|[\s])*?mux\. *\s?/;
 
-const audioCodecPattern = /voaacenc\s+bitrate=\d+\s+!\s+aacparse\s+!/;
+const audioCodecPattern = /voaacenc\s+bitrate=(\d+)\s+!\s+aacparse\s+!/;
 const audioCodecs = {'opus': 'Opus (better quality)', 'aac': 'AAC (backwards compatibility)'};
 
 const noAudioId = "No audio";
 const defaultAudioId = "Pipeline default";
-const audioSrcAliases = {"C4K": "Cam Link 4K", "usbaudio": "USB audio"};
+const audioSrcAliases = {"C4K": "Cam Link 4K", "usbaudio": "USB audio", "rockchiphdmiin": "HDMI", "rockchipes8388": "Analog in"};
 
 let audioDevices = {};
 addAudioCardById(audioDevices, noAudioId);
@@ -1814,7 +1938,10 @@ async function replaceAudioSettings(pipelineFile, cardId, codec) {
   }
 
   if (codec == "opus") {
-    pipeline = pipeline.replace(audioCodecPattern, 'audioresample quality=10 sinc-filter-mode=1 ! opusenc bitrate=128000 ! opusparse !');
+    const br = pipeline.match(audioCodecPattern);
+    if (br) {
+      pipeline = pipeline.replace(audioCodecPattern, `audioresample quality=10 sinc-filter-mode=1 ! opusenc bitrate=${br[1]} ! opusparse !`);
+    }
   }
 
   const pipelineTmp = "/tmp/belacoder_pipeline";
@@ -1837,9 +1964,9 @@ function addAudioCardById(list, id) {
 
 async function updateAudioDevices() {
   // Ignore the onboard audio cards
-  const exclude = ['tegrahda', 'tegrasndt210ref'];
+  const exclude = ['tegrahda', 'tegrasndt210ref', 'rockchipdp0', 'rockchiphdmi0', 'rockchiphdmi1', 'rockchiphdmiind', 'rockchipes8316'];
   // Devices to show at the top of the list
-  const priority = ['C4K', 'HDMI', 'usbaudio'];
+  const priority = ['HDMI', 'rockchiphdmiin', 'rockchipes8388', 'C4K', 'usbaudio'];
 
   const deviceDir = '/sys/class/sound';
   const devices = await readdirP(deviceDir);
@@ -2233,7 +2360,9 @@ function start(conn, params) {
         msg = 'The input source has stalled. Trying to restart...';
       } else if (err.match('Failed to establish an SRT connection')) {
         if (!notificationExists('srtla')) {
-          msg = 'Failed to connect to the SRT server. Retrying...';
+          let reason = err.match(/Failed to establish an SRT connection: ([\w ]+)\./);
+          reason = (reason && reason[1]) ? ` (${reason[1]})` : '';
+          msg = `Failed to connect to the SRT server${reason}. Retrying...`;
         }
       } else if (err.match(/The SRT connection.+, exiting/)) {
         if (!notificationExists('srtla')) {
@@ -2256,10 +2385,10 @@ function stopProcess(process) {
     clearTimeout(process.restartTimer);
   }
   process.removeAllListeners('exit');
-  if (process.exitCode === null) {
-    process.on('exit', function() {
-      removeProc(process);
-    })
+  process.on('exit', function() {
+    removeProc(process);
+  })
+  if (process.exitCode === null && process.signalCode === null) {
     process.kill('SIGTERM');
     return false;
   } else {
@@ -2268,11 +2397,13 @@ function stopProcess(process) {
   }
 }
 
-const stopCheckInterval = 10;
+const stopCheckInterval = 50;
 function waitForAllProcessesToTerminate() {
   if (streamingProcesses.length == 0) {
     console.log('stop: all processes terminated');
     updateStatus(false);
+
+    periodicCheckForSoftwareUpdates();
   } else {
     for (const p of streamingProcesses) {
       console.log(`stop: still waiting for ${p.spawnfile} to terminate...`);
@@ -2335,6 +2466,15 @@ spawnSync("killall", ["srtla_send"], {detached: true});
 
 /* Misc commands */
 function command(conn, cmd) {
+  switch(cmd) {
+    case 'get_log':
+      getLog(conn, 'belaUI');
+      return;
+    case 'get_syslog':
+      getLog(conn);
+      return;
+  }
+
   if (isStreaming || isUpdating()) {
     sendStatus(conn);
     return;
@@ -2356,12 +2496,6 @@ function command(conn, cmd) {
       break;
     case 'reset_ssh_pass':
       resetSshPassword(conn);
-      break;
-    case 'get_log':
-      getLog(conn, 'belaUI');
-      break;
-    case 'get_syslog':
-      getLog(conn);
       break;
   }
 }
@@ -2455,7 +2589,7 @@ const belaboxPackageList = [
 // Reboot instead of just restarting belaUI if we've updated packages matching this list
 const rebootPackageList = [
   'l4t',
-  'belabox-linux-tegra',
+  'belabox-linux-',
   'belabox-network-config'
 ];
 function packageListIncludes(list, includes) {
@@ -2499,7 +2633,7 @@ function parseAptUpgradeSummary(stdout) {
 }
 
 async function getSoftwareUpdateSize() {
-  if (isStreaming || isUpdating() || aptGetUpdating) return;
+  if (isStreaming || isUpdating() || aptGetUpdating) return 'busy';
 
   // First see if any packages can be upgraded by dist-upgrade
   let upgrade = await execPNR("apt-get dist-upgrade --assume-no");
@@ -2509,7 +2643,11 @@ async function getSoftwareUpdateSize() {
   if (res.upgradeCount == 0) {
     aptHeldBackPackages = parseAptPackageList(upgrade.stdout, "The following packages have been kept back:\n");
     if (aptHeldBackPackages) {
-      upgrade = await execPNR("apt-get upgrade --assume-no " + aptHeldBackPackages);
+      if (setup.hw == 'jetson' && aptHeldBackPackages === 'belabox') {
+        // This is a special case for upgrading from an old installation using the stock jetson kernel
+        aptHeldBackPackages = 'belabox belabox-linux-tegra';
+      }
+      upgrade = await execPNR("apt-get install --assume-no " + aptHeldBackPackages);
       res = parseAptUpgradeSummary(upgrade.stdout);
     }
   } else {
@@ -2525,6 +2663,8 @@ async function getSoftwareUpdateSize() {
 
   availableUpdates = {package_count: res.upgradeCount, download_size: res.downloadSize};
   broadcastMsg('status', {available_updates: availableUpdates});
+
+  return null;
 }
 
 function checkForSoftwareUpdates(callback) {
@@ -2550,10 +2690,24 @@ function checkForSoftwareUpdates(callback) {
   });
 }
 
+let nextCheckForSoftwareUpdates = getms();
+let nextCheckForSoftwareUpdatesTimer;
 function periodicCheckForSoftwareUpdates() {
-  checkForSoftwareUpdates(function(err, failures) {
+  if (nextCheckForSoftwareUpdatesTimer) {
+    clearTimeout(nextCheckForSoftwareUpdatesTimer);
+    nextCheckForSoftwareUpdatesTimer = undefined;
+  }
+
+  const ms = getms();
+  if (ms < nextCheckForSoftwareUpdates) {
+    nextCheckForSoftwareUpdatesTimer = setTimeout(periodicCheckForSoftwareUpdates,
+                                                  nextCheckForSoftwareUpdates-ms);
+    return;
+  }
+
+  checkForSoftwareUpdates(async function(err, failures) {
     if (err === null) {
-      getSoftwareUpdateSize();
+      err = await getSoftwareUpdateSize();
     }
     // one hour delay after a succesful check
     let delay = oneHour;
@@ -2567,7 +2721,8 @@ function periodicCheckForSoftwareUpdates() {
         delay = oneMinute;
       }
     }
-    setTimeout(periodicCheckForSoftwareUpdates, delay);
+    nextCheckForSoftwareUpdates = getms() + delay;
+    nextCheckForSoftwareUpdatesTimer = setTimeout(periodicCheckForSoftwareUpdates, delay);
   });
 }
 if (setup.apt_update_enabled) {
@@ -2606,7 +2761,7 @@ function doSoftwareUpdate() {
 
   let args = "-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ";
   if (aptHeldBackPackages) {
-    args += "upgrade " + aptHeldBackPackages;
+    args += "install " + aptHeldBackPackages;
   } else {
     args += "dist-upgrade";
   }
@@ -2784,14 +2939,14 @@ function resetSshPassword(conn) {
 
 /* Authentication */
 function setPassword(conn, password, isRemote) {
-  if (conn.isAuthed || (!isRemote && !config.password_hash)) {
+  if (conn.isAuthed || (!isRemote && !passwordHash)) {
     const minLen = 8;
     if (password.length < minLen) {
       notificationSend(conn, "belaui_pass_length", "error",
                        `Minimum password length: ${minLen} characters`, 10);
       return;
     }
-    config.password_hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
+    passwordHash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
     delete config.password;
     saveConfig();
   }
@@ -2839,13 +2994,13 @@ function connAuth(conn, sendToken) {
 }
 
 function tryAuth(conn, msg) {
-  if (!config.password_hash) {
+  if (!passwordHash) {
     conn.send(buildMsg('auth', {success: false}));
     return;
   }
 
   if (typeof(msg.password) == 'string') {
-    bcrypt.compare(msg.password, config.password_hash, function(err, match) {
+    bcrypt.compare(msg.password, passwordHash, function(err, match) {
       if (match == true && err == undefined) {
         conn.authToken = genAuthToken(msg.persistent_token);
         connAuth(conn, conn.authToken);

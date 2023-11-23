@@ -71,17 +71,29 @@ body.dark .card {
 }
 
 body.dark .table {
-  color: #FFF;
+  color: #fff;
 }
 
 body.dark .form-control, body.dark .ui-widget-content, body.dark .custom-select {
-  background-color: #E0E0E0;
+  background-color: #eee;
 }
 
 body.dark .btn-outline-secondary {
-  color: #E0E0E0;
+  color: #eee;
 }
 
 body.dark .text-secondary {
   color: #9ca5ad !important;
+}
+
+body.dark .modal-content {
+  background-color: #1e2326;
+}
+
+body.dark .close {
+  color: #fff;
+}
+
+body.dark .table-hover tbody tr:hover {
+  color: #aaa;
 }
