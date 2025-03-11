@@ -27,10 +27,13 @@ const { Resolver} = require('dns');
 const bcrypt = require('bcrypt');
 const process = require('process');
 const util = require('util');
+const assert = require('assert');
 
 const SETUP_FILE = 'setup.json';
 const CONFIG_FILE = 'config.json';
 const AUTH_TOKENS_FILE = 'auth_tokens.json';
+const RELAYS_CACHE_FILE = 'relays_cache.json';
+const GSM_OPERATORS_CACHE_FILE = 'gsm_operator_cache.json';
 
 const DNS_CACHE_FILE = 'dns_cache.json';
 /* Minimum age of an updated record to trigger a persistent DNS cache update (in ms)
@@ -213,6 +216,7 @@ async function writeTextFile(file, contents) {
 }
 
 const execP = util.promisify(exec);
+const execFileP = util.promisify(execFile);
 // Promise-based exec(), but without rejections
 async function execPNR(cmd) {
   try {
@@ -258,79 +262,8 @@ function broadcastMsgExcept(conn, type, data) {
 }
 
 
-/* Read the list of pipeline files */
-function readDirAbsPath(dir, excludePattern) {
-  const pipelines = {};
-
-  try {
-    const files = fs.readdirSync(dir);
-    const basename = path.basename(dir);
-
-    for (const f in files) {
-      const name = basename + '/' + files[f];
-      if (excludePattern && name.match(excludePattern)) continue;
-
-      const id = crypto.createHash('sha1').update(name).digest('hex');
-      const path = dir + files[f];
-      pipelines[id] = {name: name, path: path};
-    }
-  } catch (err) {
-    console.log(`Failed to read the pipeline files in ${dir}:`);
-    console.log(err);
-  };
-
-  return pipelines;
-}
-
-async function getPipelines() {
-  const ps = {};
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
-
-  // Get the hardware-specific pipelines
-  let excludePipelines;
-  if (setup.hw == 'rk3588' && !fs.existsSync('/dev/hdmirx')) {
-    excludePipelines = 'h265_hdmi';
-  }
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + `/${setup.hw}/`, excludePipelines));
-
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/generic/'));
-
-  for (const p in ps) {
-    const props = await pipelineGetAudioProps(ps[p].path)
-    Object.assign(ps[p], props);
-  }
-
-  return ps;
-}
-
-async function searchPipelines(id) {
-  const pipelines = await getPipelines();
-  if (pipelines[id]) return pipelines[id];
-  return null;
-}
-
-// pipeline list in the format needed by the frontend
-async function getPipelineList() {
-  const pipelines = await getPipelines();
-  const list = {};
-  for (const id in pipelines) {
-    list[id] = {name: pipelines[id].name, asrc: pipelines[id].asrc, acodec: pipelines[id].acodec};
-  }
-  return list;
-}
-
-
 /* Network interface list */
 let netif = {};
-
-function setNetifError(int, err) {
-  int.enabled = false;
-  int.error = err;
-}
-
-function setNetifDup(int) {
-  setNetifError(int, 'duplicate IP addr');
-}
 
 function updateNetif() {
   exec("ifconfig", (error, stdout, stderr) => {
@@ -377,7 +310,7 @@ function updateNetif() {
         }
 
         const enabled = (netif[name] && netif[name].enabled == false) ? false : true;
-        const error = netif[name] ? netif[name].error : undefined;
+        const error = netif[name] ? netif[name].error : 0;
         newints[name] = {ip: inetAddr, txb: txBytes, tp, enabled, error};
 
         // Detect interfaces that are new or with a different address
@@ -400,7 +333,7 @@ function updateNetif() {
       // Detect duplicate IP adddresses and set error status
       for (const i in newints) {
         const int = newints[i];
-        delete int.error;
+        clearNetifDup(int);
 
         if (intAddrs[int.ip] === undefined) {
           intAddrs[int.ip] = i;
@@ -445,11 +378,62 @@ function updateNetif() {
       updateSrtlaIps();
     }
 
-    broadcastMsg('netif', netif, getms() - ACTIVE_TO);
+    broadcastMsg('netif', netIfBuildMsg(), getms() - ACTIVE_TO);
   });
 }
 updateNetif();
 setInterval(updateNetif, 1000);
+
+const NETIF_ERR_DUPIPV4 = 0x01;
+const NETIF_ERR_HOTSPOT = 0x02;
+// The order is deliberate, we want *hotspot* to have higher priority
+const netIfErrors = {
+  2: 'WiFi hotspot',
+  1: 'duplicate IPv4 addr'
+}
+
+function setNetifError(int, err) {
+  if (!int) return;
+
+  int.enabled = false;
+  int.error |= err;
+}
+
+function clearNetifError(int, err) {
+  if (!int) return;
+  int.error &= ~err;
+}
+
+function setNetifDup(int) {
+  setNetifError(int, NETIF_ERR_DUPIPV4);
+}
+function clearNetifDup(int) {
+  clearNetifError(int, NETIF_ERR_DUPIPV4);
+}
+
+function setNetifHotspot(int) {
+  setNetifError(int, NETIF_ERR_HOTSPOT);
+}
+
+function netIfGetErrorMsg(i) {
+  if (i.error == 0) return;
+
+  for (const e in netIfErrors) {
+    if (i.error & e) return netIfErrors[e];
+  }
+}
+
+function netIfBuildMsg() {
+  const m = {};
+  for (const i in netif) {
+    m[i] = {ip: netif[i].ip, tp: netif[i].tp, enabled: netif[i].enabled};
+    const error = netIfGetErrorMsg(netif[i]);
+    if (error) {
+      m[i].error = error;
+    }
+  }
+  return m;
+}
 
 function countActiveNetif() {
   let count = 0;
@@ -460,25 +444,32 @@ function countActiveNetif() {
 }
 
 function handleNetif(conn, msg) {
-  const int = netif[msg['name']];
+  const int = netif[msg.name];
   if (!int) return;
 
   if (int.ip != msg.ip) return;
 
-  if (msg['enabled'] === true || msg['enabled'] === false) {
-    if (!msg['enabled'] && int.enabled && countActiveNetif() == 1) {
-      notificationSend(conn, "netif_disable_all", "error", "Can't disable all networks", 10);
-    } else if (msg['enabled'] && int.error) {
-      notificationSend(conn, "netif_enable_error", "error", `Can't enable ${msg['name']}: ${int.error}`, 10);
-    } else {
-      int.enabled = msg['enabled'];
-      if (isStreaming) {
-        updateSrtlaIps();
+  if (msg.enabled === true || msg.enabled === false) {
+    if (msg.enabled) {
+      const err = netIfGetErrorMsg(int);
+      if (err) {
+        notificationSend(conn, "netif_enable_error", "error", `Can't enable ${msg.name}: ${err}`, 10);
+        return;
       }
+    } else {
+      if (int.enabled && countActiveNetif() == 1) {
+        notificationSend(conn, "netif_disable_all", "error", "Can't disable all networks", 10);
+        return;
+      }
+    }
+
+    int.enabled = msg.enabled;
+    if (isStreaming) {
+      updateSrtlaIps();
     }
   }
 
-  conn.send(buildMsg('netif', netif));
+  conn.send(buildMsg('netif', netIfBuildMsg()));
 }
 
 
@@ -772,6 +763,12 @@ async function updateGw() {
   let goodIf;
   for (const addr of addrs) {
     for (const i in netif) {
+      const error = netIfGetErrorMsg(netif[i]);
+      if (error) {
+        console.log(`Not probing internet connectivity via ${i} (${netif[i].ip}): ${error}`);
+        continue;
+      }
+
       console.log(`Probing internet connectivity via ${i} (${netif[i].ip})`);
       if (await checkConnectivity(addr, netif[i].ip)) {
         console.log(`Internet reachable via ${i} (${netif[i].ip})`);
@@ -909,154 +906,203 @@ function wifiDeviceListGetInetAddr(ifname) {
 
 
 /* NetworkManager / nmcli helpers */
-function nmConnsGet(fields) {
+async function nmConnAdd(fields) {
   try {
-    const result = execFileSync("nmcli", [
+    let args = [
+      "connection",
+      "add"
+    ];
+    for (const field in fields) {
+      args.push(field);
+      args.push(fields[field]);
+    }
+    const result = await execFileP("nmcli", args);
+    const success = result.stdout.match(/Connection '.+' \((.+)\) successfully added./);
+
+    if (success) return success[1];
+
+  } catch ({message}) {
+    console.log(`nmConnNew err: ${message}`);
+  }
+}
+
+async function nmConnsGet(fields) {
+  try {
+    const result = await execFileP("nmcli", [
       "--terse",
       "--fields",
       fields,
       "connection",
       "show",
-    ]).toString("utf-8").split("\n");
-    return result;
+    ]);
+    return result.stdout.toString("utf-8").split("\n");
 
   } catch ({message}) {
     console.log(`nmConnsGet err: ${message}`);
   }
 }
 
-function nmConnGetFields(uuid, fields) {
+async function nmConnGetFields(uuid, fields) {
   try {
-    const result = execFileSync("nmcli", [
+    const result = await execFileP("nmcli", [
       "--terse",
       "--escape", "no",
+      "--show-secrets",
       "--get-values",
       fields,
       "connection",
       "show",
       uuid,
-    ]).toString("utf-8").split("\n");
-    return result;
+    ]);
+    return result.stdout.toString("utf-8").split("\n");
 
   } catch ({message}) {
     console.log(`nmConnGetFields err: ${message}`);
   }
 }
 
-function nmConnSetWifiMac(uuid, mac, callback) {
-  const args = [
-    "con",
-    "modify",
-    uuid,
-    "connection.interface-name",
-    "",
-    "802-11-wireless.mac-address",
-    mac
-  ];
-
-  execFile("nmcli", args, function(error, stdout, stderr) {
-    let success = true;
-    if (error || stdout != "") {
-      console.log(`nmConnSetWifiMac err: ${stdout} ${stderr}`);
-      success = false;
-    }
-
-    if (callback) {
-      callback(success);
-    }
-  });
-}
-
-function nmConnDelete(uuid, callback) {
-  execFile("nmcli", ["conn", "del", uuid], function (error, stdout, stderr) {
-    let success = true;
-    if (error || !stdout.match("successfully deleted")) {
-      console.log(`nmConnDelete err: ${stdout}`);
-      success = false;
-    }
-
-    if (callback) {
-      callback(success);
-    }
-  });
-}
-
-function nmConnect(uuid, callback) {
-  execFile("nmcli", ["conn", "up", uuid], function (error, stdout, stderr) {
-    let success = true;
-    if (error || !stdout.match("^Connection successfully activated")) {
-      console.log(`nmConnect err: ${stdout}`);
-      success = false;
-    }
-
-    if (callback) {
-      callback(success);
-    }
-  });
-}
-
-function nmDisconnect(uuid, callback) {
-  execFile("nmcli", ["conn", "down", uuid], function (error, stdout, stderr) {
-    let success = true;
-    if (error || !stdout.match("successfully deactivated")) {
-      console.log(`nmDisconnect err: ${stdout}`);
-      success = false;
-    }
-
-    if (callback) {
-      callback(success);
-    }
-  });
-}
-
-function nmDevices(fields) {
+async function nmConnSetFields(uuid, fields) {
   try {
-    const result = execFileSync("nmcli", [
+    let args = [
+      "con",
+      "modify",
+      uuid,
+    ];
+    for (const field in fields) {
+      args.push(field);
+      args.push(fields[field]);
+    }
+    const result = await execFileP("nmcli", args);
+    return (result.stdout == "");
+
+  } catch ({message}) {
+    console.log(`nmConnSetFields err: ${message}`);
+  }
+  return false;
+}
+
+async function nmConnSetWifiMac(uuid, mac) {
+  return nmConnSetFields(uuid, {'connection.interface-name': '', '802-11-wireless.mac-address': mac});
+}
+
+async function nmConnDelete(uuid) {
+  try {
+    const result = await execFileP("nmcli", ["conn", "del", uuid]);
+    return result.stdout.match("successfully deleted");
+
+  } catch ({message}) {
+    console.log(`nmConnDelete err: ${message}`);
+  }
+  return false;
+}
+
+async function nmConnect(uuid, timeout = undefined) {
+  try {
+    const timeoutArgs = timeout ? ["-w", timeout] : [];
+    const result = await execFileP("nmcli", timeoutArgs.concat(["conn", "up", uuid]));
+    return result.stdout.match("^Connection successfully activated")
+
+  } catch ({message}) {
+    console.log(`nmConnect err: ${message}`);
+  }
+  return false;
+}
+
+async function nmDisconnect(uuid) {
+  try {
+     const result = await execFileP("nmcli", ["conn", "down", uuid]);
+     return result.stdout.match("successfully deactivated");
+
+  } catch ({message}) {
+    console.log(`nmDisconnect err: ${message}`);
+  }
+  return false;
+}
+
+async function nmDevices(fields) {
+  try {
+    const result = await execFileP("nmcli", [
       "--terse",
       "--fields",
       fields,
       "device",
       "status",
-    ]).toString("utf-8").split("\n");
-    return result;
+    ]);
+    return result.stdout.toString("utf-8").split("\n");
 
   } catch ({message}) {
     console.log(`nmDevices err: ${message}`);
   }
 }
 
-function nmRescan(device, callback) {
-  const args = ["device", "wifi", "rescan"];
-  if (device) {
-    args.push("ifname");
-    args.push(device);
-  }
-  execFile("nmcli", args, function (error, stdout, stderr) {
-    let success = true;
-    if (error || stdout != "") {
-      console.log(`nmRescan err: ${stdout}`);
-      success = false;
-    }
+async function nmDeviceProp(device, fields) {
+  try {
+    const result = await execFileP("nmcli", [
+      "--terse",
+      "--escape", "no",
+      "--get-values",
+      fields,
+      "device",
+      "show",
+      device
+    ]);
+    return result.stdout.toString("utf-8").split("\n");
 
-    if (callback) {
-      callback(success);
-    }
-  });
+  } catch ({message}) {
+    console.log(`nmDeviceProp err: ${message}`);
+  }
 }
 
-function nmScanResults(fields) {
+async function nmRescan(device) {
   try {
-    const result = execFileSync("nmcli", [
+    const args = ["device", "wifi", "rescan"];
+    if (device) {
+      args.push("ifname");
+      args.push(device);
+    }
+    const result = await execFileP("nmcli", args);
+    return result.stdout == "";
+
+  } catch ({message}) {
+    console.log(`nmDevices err: ${message}`);
+  }
+  return false;
+}
+
+async function nmScanResults(fields) {
+  try {
+    const result = await execFileP("nmcli", [
       "--terse",
       "--fields",
       fields,
       "device",
       "wifi",
-    ]).toString("utf-8").split("\n");
-    return result;
+      "list",
+      "--rescan",
+      "no"
+    ]);
+    return result.stdout.toString("utf-8").split("\n");
 
   } catch ({message}) {
     console.log(`nmScanResults err: ${message}`);
+  }
+}
+
+async function nmHotspot(device, ssid, password, timeout = undefined) {
+  try {
+    const timeoutArgs = timeout ? ["-w", timeout] : [];
+    const result = await execFileP("nmcli", timeoutArgs.concat([
+      "device", "wifi",
+      "hotspot",
+      "ssid", ssid,
+      "password", password,
+      "ifname", device
+    ]));
+
+    const uuid = result.stdout.match(/successfully activated with '(.+)'/);
+    return uuid[1];
+  } catch ({message}) {
+    console.log(`nmHotspot err: ${message}`);
   }
 }
 
@@ -1086,8 +1132,17 @@ function nmcliParseSep(value) {
     'id', // numeric id for the adapter - temporary for each belaUI execution
     'ifname': 'wlanX',
     'conn': 'uuid' or undefined; // the active connection
+    'hw': 'hardware name',       // the name of the wifi adapter hardware
     'available': Map{<an>},
-    'saved': {<sn>}
+    'saved': {<sn>},
+    'hotspot': {
+      'conn': 'uuid',
+      'name': 'ssid',
+      'password': 'password',
+      'availableChannels': ['auto', 'auto_24', 'auto_50'],
+      'channel': ^see above,
+      'warnings': {} / {modified: true},
+    }
   }
 
   Available network <an>:
@@ -1118,9 +1173,26 @@ function wifiBuildMsg() {
     ifs[id] = {
       ifname: s.ifname,
       conn: s.conn,
-      available: Array.from(s.available.values()),
-      saved: s.saved
+      hw: s.hw
     };
+
+    if (wifiIfIsHotspot(s)) {
+      ifs[id].hotspot = {};
+      ifs[id].hotspot.name = s.hotspot.name;
+      ifs[id].hotspot.password = s.hotspot.password;
+      ifs[id].hotspot.available_channels = getWifiChannelMap(s.hotspot.availableChannels);
+      ifs[id].hotspot.channel = s.hotspot.channel;
+      const warnings = Object.keys(s.hotspot.warnings);
+      if (warnings.length > 0) {
+        ifs[id].hotspot.warnings = warnings;
+      }
+    } else {
+      ifs[id].available = Array.from(s.available.values());
+      ifs[id].saved = s.saved;
+      if (s.hotspot) {
+        ifs[id].supports_hotspot = true;
+      }
+    }
   }
 
   return ifs;
@@ -1130,9 +1202,113 @@ function wifiBroadcastState() {
   broadcastMsg('status', {wifi: wifiBuildMsg()});
 }
 
+const wifiChannels = {
+  auto:    {name: 'Auto (any band)', nmBand: '',   nmChannel: ''},
+  auto_24: {name: 'Auto (2.4 GHz)',  nmBand: 'bg', nmChannel: ''},
+  auto_50: {name: 'Auto (5.0 GHz)',  nmBand: 'a',  nmChannel: ''}
+};
 
-function wifiUpdateSavedConns() {
-  let connections = nmConnsGet("uuid,type");
+function getWifiChannelMap(list) {
+  const map = {};
+  for (const e of list) {
+    if (wifiChannels[e]) {
+      map[e] = {name: wifiChannels[e].name};
+    } else {
+      console.log(`Unknown WiFi channel ${e}`);
+    }
+  }
+
+  return map;
+}
+
+function channelFromNM(band, channel) {
+  for (const i in wifiChannels) {
+    if (band == wifiChannels[i].nmBand &&
+        (channel == wifiChannels[i].nmChannel || (channel == 0 && wifiChannels[i].nmChannel == ''))) {
+      return i;
+    }
+  }
+
+  console.log(`channelFromNM(): WARNING unknown NM channel (band: ${band}, channel: ${channel}`);
+  return 'auto';
+}
+
+async function handleHotspotConn(macAddr, uuid) {
+  if (!macAddr) {
+    // Check if the connection is in use for any wifi interface
+    const connIfName = await nmConnGetFields(uuid, 'connection.interface-name');
+
+    for (const m in wifiIfs) {
+      const w = wifiIfs[m];
+
+      if (w.hotspot && (w.hotspot.conn == uuid || w.ifname == connIfName)) {
+        // If we can match the connection against a certain interface
+        if (!w.hotspot.conn) {
+          // And if this interface doesn't already have a hotspot connection
+          // Try to update the connection to match the MAC address
+          if (await nmConnSetWifiMac(uuid, m)) {
+            w.hotspot.conn = uuid;
+            macAddr = m;
+          }
+        } else {
+          // If the interface already has a hotspot connection, then disable autoconnect
+          await nmConnSetFields(uuid, {'connection.autoconnect': 'no'});
+        }
+        break;
+      } // if (w.hotspot && ...)
+    } // for m in wifiIfs
+  } // !macAddr
+
+  if (!macAddr || !wifiIfs[macAddr] || !wifiIfs[macAddr].hotspot || (wifiIfs[macAddr].hotspot.conn && wifiIfs[macAddr].hotspot.conn != uuid)) {
+    return;
+  }
+
+  /*
+    we expect and will update automatically:
+    connection.autoconnect-priority: 999
+
+    we expect these settings, otherwise will mark as modified connections:
+    802-11-wireless.hidden=no
+    802-11-wireless-security.key-mgmt=wpa-psk
+    802-11-wireless-security.pairwise=ccmp
+    802-11-wireless-security.group=ccmp
+    802-11-wireless-security.proto=rsn
+    802-11-wireless-security.pmf=1 (disable) - disables requiring WPA3 Protected Management Frames for compatibility
+  */
+  const settingsFields = "connection.autoconnect-priority," +
+                         "802-11-wireless.ssid," +
+                         "802-11-wireless-security.psk," +
+                         "802-11-wireless.band," +
+                         "802-11-wireless.channel";
+  const checkFields = "802-11-wireless.hidden," +
+                      "802-11-wireless-security.key-mgmt," +
+                      "802-11-wireless-security.pairwise," +
+                      "802-11-wireless-security.group," +
+                      "802-11-wireless-security.proto," +
+                      "802-11-wireless-security.pmf";
+
+  const fields = await nmConnGetFields(uuid, `${settingsFields},${checkFields}`);
+
+  /* If the connection doesn't have maximum priority, update it
+     This is required to ensure the hotspot is started even if the Wifi
+     networks for some matching client connections are available
+  */
+  if (fields[0] != '999') {
+    await nmConnSetFields(uuid, {'connection.autoconnect-priority': 999});
+  }
+
+  wifiIfs[macAddr].hotspot.conn = uuid;
+  wifiIfs[macAddr].hotspot.name = fields[1];
+  wifiIfs[macAddr].hotspot.password = fields[2];
+  wifiIfs[macAddr].hotspot.channel = channelFromNM(fields[3], fields[4]);
+
+  if (fields[5] != "no" || fields[6] != "wpa-psk" || fields[7] != "ccmp" || fields[8] != "ccmp" || fields[9] != "rsn" || fields[10] != "1") {
+    wifiIfs[macAddr].hotspot.warnings.modified = true;
+  }
+}
+
+async function wifiUpdateSavedConns() {
+  let connections = await nmConnsGet("uuid,type");
   if (connections === undefined) return;
 
   for (const i in wifiIfs) {
@@ -1146,13 +1322,17 @@ function wifiUpdateSavedConns() {
       if (type !== "802-11-wireless") continue;
 
       // Get the device the connection is bound to and the ssid
-      const [ssid, macTmp] = nmConnGetFields(uuid, "802-11-wireless.ssid,802-11-wireless.mac-address");
+      const [mode, ssid, macTmp] = await nmConnGetFields(uuid, "802-11-wireless.mode,802-11-wireless.ssid,802-11-wireless.mac-address");
 
-      if (!ssid || !macTmp) continue;
+      if (!ssid) continue;
 
       const macAddr = macTmp.toLowerCase();
-      if (wifiIfs[macAddr]) {
-        wifiIfs[macAddr].saved[ssid] = uuid;
+      if (mode == 'ap') {
+        handleHotspotConn(macAddr, uuid);
+      } else if (mode == 'infrastructure') {
+        if (macAddr && wifiIfs[macAddr]) {
+          wifiIfs[macAddr].saved[ssid] = uuid;
+        }
       }
     } catch (err) {
       console.log(`Error getting the nmcli connection information: ${err.message}`);
@@ -1160,8 +1340,8 @@ function wifiUpdateSavedConns() {
   }
 }
 
-function wifiUpdateScanResult() {
-  const wifiNetworks = nmScanResults("active,ssid,signal,security,freq,device");
+async function wifiUpdateScanResult() {
+  const wifiNetworks = await nmScanResults("active,ssid,signal,security,freq,device");
   if (!wifiNetworks) return;
 
   for (const i in wifiIfs) {
@@ -1205,12 +1385,12 @@ function wifiScheduleScanUpdates() {
 }
 
 let unavailableDeviceRetryExpiry = 0;
-function wifiUpdateDevices() {
+async function wifiUpdateDevices() {
   let newDevices = false;
   let statusChange = false;
   let unavailableDevices = false;
 
-  let networkDevices = nmDevices("device,type,state,con-uuid");
+  let networkDevices = await nmDevices("device,type,state,con-uuid");
   if (!networkDevices) return;
 
   // sorts the results alphabetically by interface name
@@ -1253,13 +1433,32 @@ function wifiUpdateDevices() {
       } else {
         const id = wifiIfId++;
 
+        const prop = await nmDeviceProp(ifname, "GENERAL.VENDOR,GENERAL.PRODUCT,WIFI-PROPERTIES.AP,WIFI-PROPERTIES.5GHZ,WIFI-PROPERTIES.2GHZ");
+        const vendor = prop[0].replace('Corporation', '').trim();
+        const pb = prop[1].match(/[\[\(](.+)[\]\)]/);
+        const product = pb ? pb[1] : prop[1];
+
         wifiIfs[hwAddr] = {
           id,
           ifname,
+          hw: vendor + ' ' + product,
           conn,
           available: new Map(),
           saved: {}
         };
+        if (prop[2] === 'yes') {
+          wifiIfs[hwAddr].hotspot = {};
+          wifiIfs[hwAddr].hotspot.forceHotspotStatus = 0;
+          wifiIfs[hwAddr].hotspot.warnings = {};
+
+          wifiIfs[hwAddr].hotspot.availableChannels = ['auto'];
+          if (prop[3] === 'yes') {
+            wifiIfs[hwAddr].hotspot.availableChannels.push('auto_50');
+          }
+          if (prop[4] === 'yes') {
+            wifiIfs[hwAddr].hotspot.availableChannels.push('auto_24');
+          }
+        }
         newDevices = true;
         statusChange = true;
       }
@@ -1278,15 +1477,32 @@ function wifiUpdateDevices() {
   }
 
   if (newDevices) {
-    wifiUpdateSavedConns();
+    await wifiUpdateSavedConns();
     wifiScheduleScanUpdates();
   }
+
   if (statusChange) {
-    wifiUpdateScanResult();
+    await wifiUpdateScanResult();
     wifiScheduleScanUpdates();
   }
   if (newDevices || statusChange) {
     wifiBroadcastState();
+
+    // Mark any WiFi hotspot interfaces as unavailable for bonding
+    let hotspotCount = 0;
+    for (const i in wifiIfs) {
+      if (wifiIfIsHotspot(wifiIfs[i])) {
+        const n = netif[wifiIfs[i].ifname];
+        if (!n) continue;
+        if (n.error & NETIF_ERR_HOTSPOT) continue;
+
+        setNetifHotspot(n);
+        hotspotCount++;
+      }
+    }
+    if (hotspotCount && isStreaming) {
+      updateSrtlaIps();
+    }
   }
   console.log(wifiIfs);
 
@@ -1310,13 +1526,13 @@ function wifiUpdateDevices() {
   return statusChange;
 }
 
-function wifiRescan() {
-  nmRescan(undefined, function(success) {
-    /* A rescan request will fail if a previous one is in progress,
-       but we still attempt to update the results */
-    wifiUpdateScanResult();
-    wifiScheduleScanUpdates();
-  });
+async function wifiRescan() {
+  await nmRescan();
+
+  /* A rescan request will fail if a previous one is in progress,
+     but we still attempt to update the results */
+  await wifiUpdateScanResult();
+  wifiScheduleScanUpdates();
 }
 
 /* Searches saved connections in wifiIfs by UUID */
@@ -1335,36 +1551,32 @@ function wifiSearchConnection(uuid) {
   return connFound;
 }
 
-function wifiDisconnect(uuid) {
+async function wifiDisconnect(uuid) {
   if (wifiSearchConnection(uuid) === undefined) return;
 
-  nmDisconnect(uuid, function(success) {
-    if (success) {
-      wifiUpdateScanResult();
-      wifiScheduleScanUpdates();
-    }
-  });
+  if (await nmDisconnect(uuid)) {
+    await wifiUpdateScanResult();
+    wifiScheduleScanUpdates();
+  }
 }
 
-function wifiForget(uuid) {
+async function wifiForget(uuid) {
   if (wifiSearchConnection(uuid) === undefined) return;
 
-  nmConnDelete(uuid, function(success) {
-    if (success) {
-      wifiUpdateSavedConns();
-      wifiUpdateScanResult();
-      wifiScheduleScanUpdates();
-    }
-  });
+  if (await nmConnDelete(uuid)) {
+    await wifiUpdateSavedConns();
+    await wifiUpdateScanResult();
+    wifiScheduleScanUpdates();
+  }
 }
 
-function wifiDeleteFailedConns() {
-  const connections = nmConnsGet("uuid,type,timestamp");
+async function wifiDeleteFailedConns() {
+  const connections = await nmConnsGet("uuid,type,timestamp");
   for (const c in connections) {
     const [uuid, type, ts] = nmcliParseSep(connections[c]);
     if (type !== "802-11-wireless") continue;
     if (ts == 0) {
-      nmConnDelete(uuid);
+      await nmConnDelete(uuid);
     }
   }
 }
@@ -1394,9 +1606,9 @@ function wifiNew(conn, msg) {
   }
 
   const senderId = conn.senderId;
-  execFile("nmcli", args, function(error, stdout, stderr) {
+  execFile("nmcli", args, async function(error, stdout, stderr) {
     if (error || stdout.match('^Error:')) {
-      wifiDeleteFailedConns();
+      await wifiDeleteFailedConns();
 
       if (stdout.match('Secrets were required, but not provided')) {
         conn.send(buildMsg('wifi', {new: {error: "auth", device: msg.device}}, senderId));
@@ -1407,16 +1619,14 @@ function wifiNew(conn, msg) {
       const success = stdout.match(/successfully activated with '(.+)'/);
       if (success) {
         const uuid = success[1];
-        nmConnSetWifiMac(uuid, mac, function(success) {
-          if (!success) {
-            console.log("Failed to set the MAC address for the newly created connection");
-          }
+        if (!(await nmConnSetWifiMac(uuid, mac))) {
+          console.log("Failed to set the MAC address for the newly created connection");
+        }
 
-          wifiUpdateSavedConns();
-          wifiUpdateScanResult();
+        await wifiUpdateSavedConns();
+        await wifiUpdateScanResult();
 
-          conn.send(buildMsg('wifi', {new: {success: true, device: msg.device}}, senderId));
-        });
+        conn.send(buildMsg('wifi', {new: {success: true, device: msg.device}}, senderId));
       } else {
         console.log(`wifiNew: no error but not matching a successful connection msg in:\n${stdout}\n${stderr}`);
       }
@@ -1424,15 +1634,199 @@ function wifiNew(conn, msg) {
   });
 }
 
-function wifiConnect(conn, uuid) {
+async function wifiConnect(conn, uuid) {
   const deviceId = wifiSearchConnection(uuid);
   if (deviceId === undefined) return;
 
   const senderId = conn.senderId;
-  nmConnect(uuid, function(success) {
-    wifiUpdateScanResult();
-    conn.send(buildMsg('wifi', {connect: success, device: deviceId}, senderId));
-  });
+  const success = await nmConnect(uuid);
+  await wifiUpdateScanResult();
+  conn.send(buildMsg('wifi', {connect: success, device: deviceId}, senderId));
+}
+
+function wifiForceHotspot(wifi, ms) {
+  if (!wifi.hotspot) return;
+
+  if (ms <= 0) {
+    wifi.hotspot.forceHotspotStatus = 0;
+    return;
+  }
+
+  const until = getms() + ms;
+  if (until > wifi.hotspot.forceHotspotStatus) {
+    wifi.hotspot.forceHotspotStatus = until;
+  }
+}
+
+const HOTSPOT_UP_TO = 10;
+const HOTSPOT_UP_FORCE_TO = (HOTSPOT_UP_TO + 2) * 1000;
+
+async function wifiHotspotStart(msg) {
+  if (!msg.device) return;
+
+  const mac = wifiIdToHwAddr[msg.device];
+  if (!mac) return;
+
+  const i = wifiIfs[mac];
+  if (!i) return;
+  if (!i.hotspot) return; // hotspot not supported, nothing to do
+
+  if (i.hotspot.conn) {
+    if (i.hotspot.conn != i.conn) {
+      /* We assume that the operation will succeed, to be able to show an immediate response in the UI
+         But especially if we're already connected to a network in client mode, it can take a few
+         seconds before NM will show us as 'connected' to our hotspot connection.
+         We use wifiForceHotspot() to ensure the device is reported in hotspot mode for this duration
+      */
+      wifiForceHotspot(i, HOTSPOT_UP_FORCE_TO);
+      wifiBroadcastState();
+
+      if (await nmConnect(i.hotspot.conn, HOTSPOT_UP_TO)) {
+        await nmConnSetFields(i.hotspot.conn, {'connection.autoconnect': 'yes',
+                                               'connection.autoconnect-priority': 999});
+      } else {
+        // Remove the wifiForceHotspot() timer to immediately show the failure by resetting the UI to client mode
+        wifiForceHotspot(i, -1);
+        wifiUpdateDevices();
+      }
+    }
+  } else {
+    const ms = mac.split(':');
+    const name = 'BELABOX_' + ms[4] + ms[5];
+    const password = crypto.randomBytes(9).toString('base64');
+
+    // Temporary hotspot config to send to the client
+    i.hotspot.name = name;
+    i.hotspot.password = password;
+    i.hotspot.channel = 'auto';
+    wifiForceHotspot(i, HOTSPOT_UP_FORCE_TO);
+    wifiBroadcastState();
+
+    // Create the NM connection for the hotspot
+    const uuid = await nmHotspot(i.ifname, name, password, HOTSPOT_UP_TO);
+    if (uuid) {
+      // Update any settings that we need different from the default
+      await nmConnSetFields(uuid, {'connection.interface-name': '',
+                                   'connection.autoconnect': 'yes',
+                                   'connection.autoconnect-priority': 999,
+                                   '802-11-wireless.mac-address': mac,
+                                   '802-11-wireless-security.pmf': 'disable'});
+      // The updated settings will allow the connection to be recognised as our Hotspot connection
+      await wifiUpdateSavedConns();
+      // Restart the connection with the updated settings (needed to disable pmf)
+      wifiForceHotspot(i, HOTSPOT_UP_FORCE_TO);
+      await nmConnect(uuid, HOTSPOT_UP_TO);
+    } else {
+      // Remove the wifiForceHotspot() timer to immediately show the failure by resetting the UI to client mode
+      wifiForceHotspot(i, -1);
+      wifiUpdateDevices();
+    }
+  }
+}
+
+async function wifiHotspotStop(msg) {
+  if (!msg.device) return;
+
+  const mac = wifiIdToHwAddr[msg.device];
+  if (!mac) return;
+
+  const i = wifiIfs[mac];
+  if (!i) return;
+  if (!wifiIfIsHotspot(i)) return; // not in hotspot mode, nothing to do
+
+  await nmConnSetFields(i.hotspot.conn, {'connection.autoconnect': 'no'});
+
+  wifiForceHotspot(i, -1);
+  if (await nmDisconnect(i.hotspot.conn)) {
+    i.conn = null;
+    i.available.clear();
+    wifiBroadcastState();
+    wifiRescan();
+  }
+}
+
+function wifiIfIsHotspot(wifi) {
+  if (!wifi || !wifi.hotspot) return false;
+  return ((wifi.hotspot.conn && wifi.conn == wifi.hotspot.conn) ||
+          (wifi.hotspot.forceHotspotStatus > getms()));
+}
+
+function nmConnSetHotspotFields(uuid, name, password, channel) {
+  // Validate the requested channel
+  const newChannel = wifiChannels[channel];
+  if (!newChannel) return;
+
+  const settingsToChange = {
+    '802-11-wireless.ssid': name,
+    '802-11-wireless-security.psk': password,
+    '802-11-wireless.band': newChannel.nmBand,
+    '802-11-wireless.channel': newChannel.nmChannel
+  };
+
+  return nmConnSetFields(uuid, settingsToChange);
+}
+
+/*
+  Expects:
+  {
+    device: device id,
+    name,
+    password,
+    channel  // from wifiChannels
+  }
+*/
+async function wifiHotspotConfig(conn, msg) {
+  // Find the Wifi interface
+  if (!msg.device) return;
+
+  const mac = wifiIdToHwAddr[msg.device];
+  if (!mac) return;
+
+  const i = wifiIfs[mac];
+  if (!i) return;
+  if (!wifiIfIsHotspot(i)) return; // Make sure the interface is already in hotspot mode
+
+  const senderId = conn.senderId;
+
+  // Make sure all required fields are present and valid
+  if (msg.name === undefined || typeof msg.name != 'string' ||
+      msg.name.length < 1 || msg.name.length > 32) {
+    conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, error: 'name'}}}, senderId));
+    return;
+  }
+
+  if (msg.password === undefined || typeof msg.password != 'string' ||
+      msg.password.length < 8 || msg.password.length > 64) {
+    conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, error: 'password'}}}, senderId));
+    return;
+  }
+
+  if (msg.channel === undefined || typeof msg.channel != 'string' || !wifiChannels[msg.channel]) {
+    conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, error: 'channel'}}}, senderId));
+    return;
+  }
+
+  // Update the NM connection
+  if (!(await nmConnSetHotspotFields(i.hotspot.conn, msg.name, msg.password, msg.channel))) {
+    conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, error: 'saving'}}}, senderId));
+    return;
+  }
+
+  // Restart the connection with the updated config
+  wifiForceHotspot(i, HOTSPOT_UP_FORCE_TO);
+  if (!(await nmConnect(i.hotspot.conn, HOTSPOT_UP_TO))) {
+    conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, error: 'activating'}}}, senderId));
+    // Failed to bring up the hotspot with the new settings; restore it
+    wifiForceHotspot(i, HOTSPOT_UP_FORCE_TO);
+    await nmConnSetHotspotFields(i.hotspot.conn, i.hotspot.name, i.hotspot.password, i.hotspot.channel);
+    await nmConnect(i.hotspot.conn, HOTSPOT_UP_TO);
+    return;
+  }
+
+  // Succesfully brought up the hotspot with the new settings, reload the NM connection
+  await wifiUpdateSavedConns();
+
+  conn.send(buildMsg('wifi', {hotspot: {config: {device: msg.device, success: true}}}, senderId));
 }
 
 function handleWifi(conn, msg) {
@@ -1453,6 +1847,729 @@ function handleWifi(conn, msg) {
       case 'forget':
         wifiForget(msg[type]);
         break;
+      case 'hotspot':
+        if (msg[type].start) {
+          wifiHotspotStart(msg[type].start);
+        } else if (msg[type].stop) {
+          wifiHotspotStop(msg[type].stop);
+        } else if (msg[type].config) {
+          wifiHotspotConfig(conn, msg[type].config);
+        }
+        break;
+    }
+  }
+}
+
+
+/*
+  mmcli helpers
+*/
+function mmcliParseSep(input) {
+  let output = {};
+  for (let line of input.split('\n')) {
+    line = line.replace(/\\\d+/g, ''); // strips special escaped characters
+    if (!line) continue;
+
+    const kv = line.split(/:(.*)/); // splits on the first ':' only
+    if (kv.length != 3) {
+      console.log(`mmcliParseSep: error parsing line ${line}`);
+      continue;
+    }
+    let key = kv[0].trim();
+    let value = kv[1].trim();
+
+    // Parse mmcli arrays
+    let pattern = /\.length$/;
+    if (key.match(pattern)) {
+      key = key.replace(pattern, '');
+      value = [];
+    }
+    pattern = /\.value\[\d+\]$/;
+    if (key.match(pattern)) {
+      key = key.replace(pattern, '');
+      output[key].push(value);
+      continue;
+    }
+
+    // skip empty values
+    if (value == '--') continue;
+
+    output[key] = value;
+  }
+
+  return output;
+}
+
+function mmConvertNetworkType(mmType) {
+  const typeMatch = mmType.match(/^allowed: (.+); preferred: (.+)$/);
+  const label = typeMatch[1].split(/,? /).sort().reverse().join('');
+  const allowed = typeMatch[1].replace(/,? /g, '|');
+  const preferred = typeMatch[2];
+  return {label, allowed, preferred};
+}
+
+function mmConvertNetworkTypes(mmTypes) {
+  const types = {};
+  for (const mmType of mmTypes) {
+    const type = mmConvertNetworkType(mmType);
+    if (!types[type.label] || types[type.label].preferred == 'none' || types[type.label].preferred < type.preferred) {
+      types[type.label] = {allowed: type.allowed, preferred: type.preferred};
+    }
+  }
+  return types;
+}
+
+function mmConvertAccessTech(accessTechs) {
+  if (!accessTechs || accessTechs.length == 0) {
+    return;
+  }
+
+  const accessTechToGen = {
+    'gsm': '2G',
+    'umts': '3G',
+    'hsdpa': '3G+',
+    'hsupa': '3G+',
+    'lte': '4G',
+    '5gnr': '5G'
+  };
+  // Return the highest gen for situations such as 5G NSA, which will report "lte, 5gnr"
+  let gen = '';
+  for (const t of accessTechs) {
+    if (accessTechToGen[t] > gen) {
+      gen = accessTechToGen[t];
+    }
+  }
+
+  // If we only encountered unknown access techs, simply return the first one
+  if (!gen) return accessTechs[0];
+  return gen;
+}
+
+async function mmList() {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-L"]);
+    const modems = mmcliParseSep(result.stdout.toString("utf-8"))['modem-list'];
+    let list = [];
+    for (const m of modems) {
+      const id = m.match(/\/org\/freedesktop\/ModemManager1\/Modem\/(\d+)/);
+      if (id) {
+        list.push(parseInt(id[1]));
+      }
+    }
+    return list;
+  } catch ({message}) {
+    console.log(`mmList err: ${message}`);
+  }
+}
+
+async function mmGetModem(id) {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-m", id]);
+    return mmcliParseSep(result.stdout.toString("utf-8"));
+  } catch ({message}) {
+    console.log(`mmGetModem err: ${message}`);
+  }
+}
+
+async function mmGetSim(id) {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-i", id]);
+    return mmcliParseSep(result.stdout.toString("utf-8"));
+  } catch ({message}) {
+    console.log(`mmGetSim err: ${message}`);
+  }
+}
+
+async function mmSetNetworkTypes(id, allowed, preferred) {
+  try {
+    let args = [
+      "-m", id,
+      `--set-allowed-modes=${allowed}`
+    ];
+    if (preferred != 'none') {
+      args.push(`--set-preferred-mode=${preferred}`);
+    }
+    const result = await execFileP("mmcli", args);
+    return result.stdout.match(/successfully set current modes in the modem/);
+  } catch ({message}) {
+    console.log(`mmSetNetworkTypes err: ${message}`);
+  }
+}
+
+async function mmNetworkScan(id, timeout=240) {
+  try {
+    const result = await execFileP("mmcli", [`--timeout=${timeout}`, "-K", "-m", id, "--3gpp-scan"]);
+    const networks = mmcliParseSep(result.stdout.toString("utf-8"))['modem.3gpp.scan-networks'];
+    const parsed = networks.map(function(n) {
+      const info = n.split(/, */);
+      const output = {};
+      for (const entry of info) {
+        const kv = entry.split(/: */);
+        output[kv[0]] = kv[1];
+      }
+      return output;
+    });
+    return parsed;
+  } catch ({message}) {
+    console.log(`mmNetworkScan err: ${message}`);
+  }
+}
+
+
+/*
+  ModemManager / NetworkManager based modem management
+
+  Structs:
+
+  Modem list <modems>:
+  {
+    MMid: <modem>
+  }
+
+  Individual modem struct <modem>:
+  {
+    ifname: wwan0,
+    name: "QUECTEL Broadband Module - 00000 | VINAPHONE", <Model - partial IMEI | SIM provider>
+    network_type: {
+      supported: ['2g', 3g', '3g4g', '4g'],
+      config: '3g4g',
+    },
+    is_scanning: true/undefined,
+    inhibit: true/undefined, // don't bring up automatically
+    config: {
+      conn: 'nmUuid',
+      autoconfig: true/false, // only if(setup.has_gsm_autoconfig)
+      apn: '',
+      username: '',
+      password: '',
+      roaming: true/false,
+      network: ''
+    },
+    status: {
+      state: 'connecting', 'connected', 'disconnected', etc
+      network: '<GSM NETWORK NAME>',
+      network_type: 3g/4g,
+      signal: 0-100,
+      roaming: true/false,
+    }
+    available_networks: undefined or {
+      'id': {
+        name: '',
+        availability: 'available', 'forbidden', etc
+      }
+    }
+  }
+*/
+let modems = {};
+
+let gsmOperatorsCache = {};
+try {
+  gsmOperatorsCache = JSON.parse(fs.readFileSync(GSM_OPERATORS_CACHE_FILE, 'utf8'));
+} catch(err) {
+  console.log("Failed to load the persistent GSM operators cache, starting with an empty cache");
+}
+async function gsmOperatorsAdd(id, name) {
+  if (!gsmOperatorsCache[id] || gsmOperatorsCache[id] != name) {
+    gsmOperatorsCache[id] = name;
+    await writeTextFile(GSM_OPERATORS_CACHE_FILE, JSON.stringify(gsmOperatorsCache));
+  }
+}
+
+async function getGsmConns() {
+  let byDevice = {};
+  let byOperator = {};
+  let byUuid = {};
+
+  const conns = await nmConnsGet("uuid,type,state");
+  for (const c of conns) {
+    const [uuid, type, state] = nmcliParseSep(c);
+
+    if (type != 'gsm') continue;
+
+    let fields = "gsm.device-id,gsm.sim-id,gsm.sim-operator-id,gsm.apn,gsm.username,gsm.password,gsm.home-only,gsm.network-id"
+    if (setup.has_gsm_autoconfig) {
+      fields += ",gsm.auto-config";
+    }
+    const connInfo = await nmConnGetFields(uuid, fields);
+
+    const deviceId = connInfo[0];
+    const simId = connInfo[1];
+    const operatorId = connInfo[2];
+    const apn = connInfo[3];
+    const username = connInfo[4];
+    const password = connInfo[5];
+    const roaming = (connInfo[6] == 'no');
+    const network = connInfo[7];
+
+    const conn = {state, uuid, deviceId, simId, operatorId, apn, username, password, roaming, network};
+    if (setup.has_gsm_autoconfig) {
+      conn.autoconfig = (connInfo[8] == 'yes');
+    }
+
+    byUuid[uuid] = conn;
+
+    if (deviceId && simId) {
+      if (!byDevice[deviceId]) {
+        byDevice[deviceId] = {};
+      }
+      byDevice[deviceId][simId] = conn;
+    }
+
+    if (operatorId) {
+      byOperator[operatorId] = conn;
+    }
+  }
+
+  return {byDevice, byOperator, byUuid};
+}
+
+function modemConfigSantizeToNM(config) {
+  fields = {};
+  if (setup.has_gsm_autoconfig) {
+    fields['gsm.auto-config'] = (config.autoconfig ? 'yes' : 'no');
+    if (config.autoconfig) {
+      config.apn = '';
+      config.username = '';
+      config.password = '';
+    }
+  } else {
+    delete config.autoconfig;
+  }
+  fields['gsm.apn'] = config.apn;
+  fields['gsm.username'] = config.username;
+  fields['gsm.password'] = config.password;
+  fields['gsm.password-flags'] = (!config.password ? 4 : 0);
+  fields['gsm.home-only'] = (config.roaming ? 'no': 'yes');
+  fields['gsm.network-id'] = (config.roaming ? config.network : '');
+
+  return fields;
+}
+
+async function modemGetConfig(modemInfo, simInfo, gsmConns) {
+  if (!modemInfo || !simInfo || !gsmConns) return;
+
+  const modemId = modemInfo['modem.generic.device-identifier'];
+  const simId = simInfo['sim.properties.iccid'];
+  const operatorId = simInfo['sim.properties.operator-code'];
+  let config;
+
+  if (gsmConns.byDevice[modemId] && gsmConns.byDevice[modemId][simId]) {
+    const ci = gsmConns.byDevice[modemId][simId];
+    config = {conn: ci.uuid, autoconfig: ci.autoconfig, apn: ci.apn, username: ci.username,
+              password: ci.password, roaming: ci.roaming, network: ci.network};
+    console.log(`Found NM connection ${config.conn} for modem ${modemId}`);
+    return config;
+  }
+
+  if (gsmConns && operatorId && gsmConns.byOperator[operatorId]) {
+    // Copy the settings from an existing config for the same operator
+    const ci = gsmConns.byOperator[operatorId];
+    config = {autoconfig: ci.autoconfig, apn: ci.apn, username: ci.username, password: ci.password,
+              roaming: ci.roaming, network: ci.network};
+  } else {
+    // New connection profile
+    config = {autoconfig: true, apn: 'internet', username: '', password: '', roaming: true, network: ''};
+  }
+
+  // The NM connection doesn't exist yet, create it
+  //const autoconnect = (modemInfo['modem.3gpp.registration-state'] != 'idle') ? 'yes' : 'no';
+  const nmConfig = {
+    'type': 'gsm',
+    'ifname': '', // can be empty for gsm connections, matching by device-id and sim-id
+    'autoconnect': 'yes',
+    'connection.autoconnect-retries': 10,
+    'ipv6.method': 'ignore',
+    'gsm.device-id': modemId,
+    'gsm.sim-id': simId
+  };
+  if (operatorId) {
+    nmConfig['gsm.sim-operator-id'] = operatorId;
+  }
+  Object.assign(nmConfig, modemConfigSantizeToNM(config))
+  const uuid = await nmConnAdd(nmConfig);
+  if (uuid) {
+    config.conn = uuid;
+    console.log(`Created NM connection ${uuid} for ${modemId}`);
+    console.log(config);
+  }
+
+  return config;
+}
+
+function modemUpdateStatus(modemInfo, modem) {
+  // Some modems don't seem to always report the operator's name
+  let network = modemInfo['modem.3gpp.operator-name'];
+  if (!network && modemInfo['modem.3gpp.registration-state'] == 'home') {
+    network = modem.sim_network;
+  }
+  const network_type = mmConvertAccessTech(modemInfo['modem.generic.access-technologies']);
+  const signal = modemInfo['modem.generic.signal-quality.value'];
+  const roaming = modemInfo['modem.3gpp.registration-state'] == 'roaming';
+  let connection = modem.is_scanning ? 'scanning' : modemInfo['modem.generic.state'];
+
+  modem.status = {connection, network, network_type, signal, roaming};
+}
+
+async function modemNetworkScan(id) {
+  const modem = modems[id];
+
+  if (!modem || !modem.config || !modem.status || modem.is_scanning) return;
+
+  modem.is_scanning = true;
+
+  if (modem.config && modem.config.conn) {
+    await nmDisconnect(modem.config.conn);
+  }
+  const results = await mmNetworkScan(id);
+
+  delete modem.is_scanning;
+
+  /* Even if no new results are returned, resend the old ones
+     to inform the clients that the scan was completed */
+  if (!results) {
+    broadcastModemAvailableNetworks(id);
+    return;
+  }
+
+  /* Some (but not all) modems return separate results for each network type (3G, 4G, etc),
+     but we merge them as we have a separate network type setting */
+  const availableNetworks = {};
+  for (const r of results) {
+    const code = r['operator-code'];
+    /* We rewrite 'current' to 'available' as these results are cached
+       and could be shown even after switching to a different network.
+       We remove the availability info if 'unknown' */
+    switch (r.availability) {
+      case 'current':
+        r.availability = 'available';
+        break;
+      case 'unknown':
+        delete r.availability;
+        break;
+    }
+    if (availableNetworks[code]) {
+      if (r.availability == 'available' && availableNetworks[code].availability != 'available') {
+        availableNetworks[code].availability = 'available';
+      }
+    } else {
+      availableNetworks[code] = {
+        name: r['operator-name'],
+        availability: r['availability']
+      };
+    }
+  }
+
+  modem.available_networks = availableNetworks;
+  broadcastModemAvailableNetworks(id);
+}
+
+async function registerModem(id) {
+  if (modems[id]) {
+    throw new Error(`Trying to register existing modem id ${id}`);
+  }
+
+  // Get all the required info for the modem
+  const modemInfo = await mmGetModem(id);
+
+  let simInfo, config;
+  if (modemInfo['modem.generic.sim']) {
+    const simId = modemInfo['modem.generic.sim'].match(/\/org\/freedesktop\/ModemManager1\/SIM\/(\d+)/);
+    if (simId) {
+      simInfo = await mmGetSim(simId[1]);
+      // If a SIM is present, try to find a matching NM connection or create one
+      if (simInfo) {
+        if (!gsmConns) {
+          gsmConns = await getGsmConns();
+        }
+        config = await modemGetConfig(modemInfo, simInfo, gsmConns);
+      }
+    }
+  }
+
+  // Find the network interface name
+  let ifname;
+  for (const port of modemInfo['modem.generic.ports']) {
+    const pattern = / \(net\)$/;
+    if (port.match(pattern)) {
+      ifname = port.replace(pattern, '');
+      break;
+    }
+  }
+
+  // Find the current network type
+  let networkType = mmConvertNetworkType(modemInfo['modem.generic.current-modes']);
+
+  // Find the supported network types
+  const networkTypes = mmConvertNetworkTypes(modemInfo['modem.generic.supported-modes']);
+
+  // Make sure the current mode is on the list
+  if (networkType && !networkTypes[networkType.label]) {
+    networkTypes[networkType.label] = {allowed: networkType.allowed, preferred: networkType.preferred};
+  }
+  networkType = networkType.label;
+
+  let partialImei = modemInfo['modem.generic.equipment-identifier'];
+  partialImei = partialImei.substr(partialImei.length - 5, 5);
+  const hwName = `${modemInfo['modem.generic.model']} - ${partialImei}`
+
+  let simNetwork = '<NO SIM>';
+  if (simInfo) {
+    simNetwork = simInfo['sim.properties.operator-name'] || 'Unknown';
+  }
+
+  const modem = {};
+  modem.ifname = ifname;
+  modem.name = `${hwName} | ${simNetwork}`;
+  modem.sim_network = simNetwork;
+  modem.network_type = {};
+  modem.network_type.supported = networkTypes;
+  modem.network_type.active = networkType;
+  modem.config = config;
+  modemUpdateStatus(modemInfo, modem);
+
+  modems[id] = modem;
+}
+
+function modemGetAvailableNetworks(modem) {
+  if (!modem.config || modem.config.network == '') return modem.available_networks || {};
+
+  let networks = Object.assign({}, modem.available_networks);
+  if (!modem.available_networks) {
+    const name = gsmOperatorsCache[modem.config.network] || `Operator ID ${modem.config.network}`;
+    networks[modem.config.network] = {name};
+  } else if (!modem.available_networks[modem.config.network]) {
+    networks[modem.config.network] = {name: 'Test', availability: 'unavailable'};
+  }
+
+  return networks;
+}
+
+function modemsBuildMsg(modemsFullState = undefined) {
+  let msg = {};
+  for (const i in modems) {
+    const full = (modemsFullState == undefined || modemsFullState[i]);
+
+    msg[i] = {};
+
+    if (full) {
+      msg[i].ifname = modems[i].ifname;
+      msg[i].name = modems[i].name;
+      msg[i].network_type = {};
+      msg[i].network_type.supported = Object.keys(modems[i].network_type.supported);
+      msg[i].network_type.active = modems[i].network_type.active;
+
+      if (modems[i].config) {
+        msg[i].config = {};
+        if (setup.has_gsm_autoconfig) {
+          msg[i].config.autoconfig = modems[i].config.autoconfig;
+        }
+        msg[i].config.apn = modems[i].config.apn;
+        msg[i].config.username = modems[i].config.username;
+        msg[i].config.password = modems[i].config.password;
+        msg[i].config.roaming = modems[i].config.roaming;
+        msg[i].config.network = modems[i].config.network;
+      } else {
+        msg[i].no_sim = true;
+      }
+
+      msg[i].available_networks = modemGetAvailableNetworks(modems[i]);
+    }
+
+    if (!modems[i].status) continue;
+
+    msg[i].status = {};
+    msg[i].status.connection = modems[i].status.connection;
+    msg[i].status.network = modems[i].status.network;
+    msg[i].status.network_type = modems[i].status.network_type;
+    msg[i].status.signal = modems[i].status.signal;
+    msg[i].status.roaming = modems[i].status.roaming;
+  }
+
+  return msg;
+}
+
+function broadcastModems(modemsFullState = undefined) {
+  broadcastMsg('status', {modems: modemsBuildMsg(modemsFullState)});
+}
+
+function modemBuildAvailableNetworksMessage(id) {
+  const msg = {};
+
+  for (const i in modems) {
+    msg[i] = {};
+    if (id == i) {
+      msg[i].available_networks = modemGetAvailableNetworks(modems[i]);
+    }
+  }
+
+  return msg;
+}
+
+function broadcastModemAvailableNetworks(id) {
+  broadcastMsg('status', {modems: modemBuildAvailableNetworksMessage(id)});
+}
+
+// Global variable, to allow fetching once in updateModems() and reuse in registerModem()
+let gsmConns;
+
+async function updateModems() {
+  for (const m in modems) {
+    modems[m].removed = true;
+  }
+  const modemList = await mmList() || [];
+
+  // NM gsm connections to match with new modems - filled on demand if any new modems have been found
+  gsmConns = undefined;
+  let newModems = {};
+
+  for (const m of modemList) {
+    if (modems[m]) {
+      // The modem is already registered, unmark it for deletion
+      delete modems[m].removed;
+
+      const modemInfo = await mmGetModem(m);
+      if (!modemInfo) continue;
+
+      const modem = modems[m];
+      modemUpdateStatus(modemInfo, modem);
+
+      // If the modem has an inactive NM connection and isn't otherwise busy, then try to bring it up
+      if (!modem.inhibit && !modem.is_scanning &&
+          modem.status && (modem.status.connection == 'registered' || modem.status.connection == 'enabled') &&
+          modem.config && modem.config.conn) {
+        // Don't try to activate NM connections that are already active
+        const nmConnection = (await nmConnGetFields(modem.config.conn, 'GENERAL.STATE'));
+        if (nmConnection.length == 1) {
+          console.log(`Trying to bring up connection ${modem.config.conn} for modem ${m}...`);
+          nmConnect(modem.config.conn);
+        }
+      }
+    } else {
+      try {
+        await registerModem(m);
+        newModems[m] = true;
+        console.log(JSON.stringify(modems[m], undefined, 2));
+      } catch(e) {
+        console.log(`Failed to register modem ${m}`);
+      }
+    }
+  } // for (const m of modemList)
+
+  // If any modems were removed, delete them
+  for (const m in modems) {
+    if (modems[m].removed) {
+      console.log(`Modem ${m} removed`);
+      delete modems[m];
+    }
+  }
+
+  broadcastModems(newModems);
+
+  setTimeout(updateModems, 1000);
+}
+updateModems();
+
+async function handleModemConfig(conn, msg) {
+  if (!msg.device || !modems[msg.device]) {
+    console.log(`Ignoring modem config for unknown modem ${msg.device}`);
+    return;
+  }
+
+  const modem = modems[msg.device];
+  if (!modem.config || !modem.config.conn) {
+    console.log(`Ignoring modem config for unconfigured modem ${msg.device}`);
+    console.log(modem.config);
+    return;
+  }
+  const connUuid = modem.config.conn;
+  if (!connUuid) {
+    console.log(`Ignoring modem config for modem ${msg.device} with no connection UUID`);
+    return;
+  }
+
+  // Ensure the configuration message has all the required fields
+  if ((msg.roaming !== true && msg.roaming !== false) ||
+      (msg.autoconfig !== true && msg.autoconfig !== false) ||
+      (typeof msg.apn != 'string') ||
+      (typeof msg.username != 'string') ||
+      (typeof msg.password != 'string') ||
+      (typeof msg.network != 'string') ||
+      (typeof msg.network_type != 'string')) {
+    console.log(`Received invalid configuration for modem ${msg.device}`);
+    console.log(msg);
+    return;
+  }
+
+  // Ensure the selected network type is supported
+  const networkType = modem.network_type.supported[msg.network_type];
+  if (!networkType) {
+    console.log(`Received invalid network type ${msg.network_type} for modem ${msg.device}`);
+    return;
+  }
+
+  // Only allow automatic network selection, the network previously saved, or a network included in the scan results
+  if (msg.network != '' && msg.network != modem.config.network &&
+      (!modem.available_networks || !modem.available_networks[msg.network])) {
+    console.log(`Received unavailable network ${msg.network} for modem ${msg.device}`);
+    return;
+  }
+
+  // If a new network is selected, write it to the GSM operators cache
+  if (msg.network != '' && modem.available_networks && modem.available_networks[msg.network]) {
+    gsmOperatorsAdd(msg.network, modem.available_networks[msg.network].name);
+  }
+
+  // Temporary config that we'll attempt to write
+  let updatedConfig = {
+    autoconfig: msg.autoconfig,
+    apn: msg.apn,
+    username: msg.username,
+    password: msg.password,
+    roaming: msg.roaming,
+    network: msg.network
+  }
+  // This also modifies config in place to clear apn/username/password if autoconfig is set
+  const result = await nmConnSetFields(connUuid, modemConfigSantizeToNM(updatedConfig));
+  if (result) {
+    // This preserves the 'conn' UUID value
+    Object.assign(modem.config, updatedConfig);
+  } else {
+    console.log(`Failed to update NM connection ${modem.config.conn} for modem ${msg.device} to:`);
+    console.log(updatedConfig);
+  }
+
+  // Bring the connection down to reload the settings, and set the network types, if needed
+  modem.inhibit = true;
+  await nmDisconnect(connUuid);
+  if (msg.network_type != modem.network_type.active) {
+    const result = await mmSetNetworkTypes(msg.device, networkType.allowed, networkType.preferred);
+    if (result) {
+      modem.network_type.active = msg.network_type;
+    }
+  }
+  delete modem.inhibit;
+
+  // Send the updated settings to the clients
+  const updatedModem = {};
+  updatedModem[msg.device] = true;
+  broadcastModems(updatedModem);
+}
+
+async function handleModemScan(conn, msg) {
+  if (!msg || !modems[msg.device]) return;
+
+  await modemNetworkScan(msg.device);
+}
+
+function handleModems(conn, msg) {
+  for (const type in msg) {
+    switch (type) {
+      case 'config':
+        handleModemConfig(conn, msg[type]);
+        break;
+      case 'scan':
+        handleModemScan(conn, msg[type]);
+        break;
     }
   }
 }
@@ -1472,8 +2589,11 @@ function handleWifi(conn, msg) {
   9 - support for the get_log command
   10 - support for the get_syslog command
   11 - support for the asrc and acodec settings
+  12 - support for receiving relay accounts and relay servers
+  13 - wifi hotspot mode
+  14 - support for the modem manager
 */
-const remoteProtocolVersion = 11;
+const remoteProtocolVersion = 14;
 const remoteEndpointHost = 'remote.belabox.net';
 const remoteEndpointPath = '/ws/remote';
 const remoteTimeout = 5000;
@@ -1497,6 +2617,137 @@ function handleRemote(conn, msg) {
           console.log('remote: invalid key');
         }
         break;
+      case 'relays':
+        handleRemoteRelays(msg[type]);
+        break;
+    }
+  }
+}
+
+let relaysCache;
+try {
+  relaysCache = JSON.parse(fs.readFileSync(RELAYS_CACHE_FILE, 'utf8'));
+} catch(err) {
+  console.log("Failed to load the relays cache, starting with an empty cache");
+}
+
+function buildRelaysMsg() {
+  const msg = {};
+  msg.servers = {};
+  msg.accounts = {};
+
+  if (relaysCache) {
+    for (const s in relaysCache.servers) {
+      msg.servers[s] = {name: relaysCache.servers[s].name};
+      if (relaysCache.servers[s].default) msg.servers[s].default = true;
+    }
+    for (const a in relaysCache.accounts) {
+      msg.accounts[a] = {name: relaysCache.accounts[a].name};
+      if (relaysCache.accounts[a].disabled) {
+        msg.accounts[a].name += ' [disabled]';
+        msg.accounts[a].disabled = true;
+      }
+    }
+  }
+
+  return msg;
+}
+
+async function updateCachedRelays(relays) {
+  try {
+    assert.deepStrictEqual(relays, relaysCache);
+  } catch (err) {
+    console.log('updated the relays cache:');
+    console.log(relays);
+    relaysCache = relays;
+    await writeTextFile(RELAYS_CACHE_FILE, JSON.stringify(relays));
+    return true;
+  }
+}
+
+function validateRemoteRelays(msg) {
+  try {
+    const out = {servers: {}, accounts: {}};
+    for (const r_id in msg.servers) {
+      const r = msg.servers[r_id];
+      if (r.type !== "srtla" || typeof r.name != 'string' || typeof r.addr != 'string') continue;
+      if (r.default && r.default !== true) continue;
+      if (!validatePortNo(r.port)) continue;
+
+      out.servers[r_id] = {type: r.type, name: r.name, addr: r.addr, port: r.port};
+      if (r.default) out.servers[r_id].default = true;
+    }
+
+    for (const a_id in msg.accounts) {
+      const a = msg.accounts[a_id];
+      if (typeof a.name != 'string' || typeof a.ingest_key != 'string') continue;
+
+      out.accounts[a_id] = {name: a.name, ingest_key: a.ingest_key};
+      if (a.disabled) out.accounts[a_id].disabled = true;
+    }
+
+    if (Object.keys(out.servers).length < 1) return;
+
+    return out;
+  } catch(err) {
+    return undefined;
+  }
+}
+
+function convertManualToRemoteRelay() {
+  if (!relaysCache) return false;
+
+  let modified = false;
+
+  if (!config.relay_server && config.srtla_addr && config.srtla_port) {
+    for (const s in relaysCache.servers) {
+      if (relaysCache.servers[s].addr.toLowerCase() === config.srtla_addr.toLowerCase()
+          && relaysCache.servers[s].port == config.srtla_port) {
+        config.relay_server = s;
+        modified = true;
+        break;
+      }
+    }
+  }
+
+  // If not using a relay server, don't try to convert the streamid to a relay account
+  if (!config.relay_server) {
+    return false;
+  }
+
+  if (config.srtla_addr || config.srtla_port) {
+    delete config.srtla_addr;
+    delete config.srtla_port;
+    modified = true;
+  }
+
+  if (!config.relay_account && config.srt_streamid) {
+    for (const a in relaysCache.accounts) {
+      if (relaysCache.accounts[a].ingest_key === config.srt_streamid) {
+        config.relay_account = a;
+        modified = true;
+        break;
+      }
+    }
+  }
+
+  if (config.relay_account && config.srt_streamid) {
+    delete config.srt_streamid;
+    modified = true;
+  }
+
+  return modified;
+}
+
+function handleRemoteRelays(msg) {
+  msg = validateRemoteRelays(msg);
+  if (!msg) return;
+
+  if (updateCachedRelays(msg)) {
+    broadcastMsg('relays', buildRelaysMsg());
+    if (convertManualToRemoteRelay()) {
+      saveConfig();
+      broadcastMsg('config', config);
     }
   }
 }
@@ -1597,6 +2848,8 @@ setInterval(remoteKeepalive, 1000);
 
 function setRemoteKey(key) {
   config.remote_key = key;
+  delete config.relay_server;
+  delete config.relay_account;
   saveConfig();
 
   if (remoteWs) {
@@ -1604,6 +2857,11 @@ function setRemoteKey(key) {
     remoteWs.terminate();
   }
   remoteConnect();
+
+  // Clear the remote relays when switching to a different remote key
+  if (updateCachedRelays(undefined)) {
+    broadcastMsg('relays', buildRelaysMsg());
+  }
 
   broadcastMsg('config', config);
 }
@@ -1917,9 +3175,9 @@ addAudioCardById(audioDevices, noAudioId);
 addAudioCardById(audioDevices, defaultAudioId);
 
 
-async function pipelineGetAudioProps(path) {
+function pipelineGetAudioProps(path) {
   const props = {};
-  const contents = await readTextFile(path);
+  const contents = fs.readFileSync(path, 'utf8');
   props.asrc = contents.match(alsaPipelinePattern) != null;
   props.acodec = contents.match(audioCodecPattern) != null;
   return props;
@@ -1964,7 +3222,7 @@ function addAudioCardById(list, id) {
 
 async function updateAudioDevices() {
   // Ignore the onboard audio cards
-  const exclude = ['tegrahda', 'tegrasndt210ref', 'rockchipdp0', 'rockchiphdmi0', 'rockchiphdmi1', 'rockchiphdmiind', 'rockchipes8316'];
+  const exclude = ['tegrahda', 'tegrasndt210ref', 'rockchipdp0', 'rockchiphdmi0', 'rockchiphdmi1', 'rockchiphdmi2', 'rockchiphdmiind', 'rockchipes8316'];
   // Devices to show at the top of the list
   const priority = ['HDMI', 'rockchiphdmiin', 'rockchipes8388', 'C4K', 'usbaudio'];
 
@@ -2009,6 +3267,67 @@ async function updateAudioDevices() {
   broadcastMsg('status', {asrcs: Object.keys(audioDevices)});
 }
 updateAudioDevices();
+
+
+/* Read the list of pipeline files */
+function readDirAbsPath(dir, excludePattern) {
+  const pipelines = {};
+
+  try {
+    const files = fs.readdirSync(dir);
+    const basename = path.basename(dir);
+
+    for (const f in files) {
+      const name = basename + '/' + files[f];
+      if (excludePattern && name.match(excludePattern)) continue;
+
+      const id = crypto.createHash('sha1').update(name).digest('hex');
+      const path = dir + files[f];
+      pipelines[id] = {name: name, path: path};
+    }
+  } catch (err) {
+    console.log(`Failed to read the pipeline files in ${dir}:`);
+    console.log(err);
+  };
+
+  return pipelines;
+}
+
+function getPipelines() {
+  const ps = {};
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
+
+  // Get the hardware-specific pipelines
+  let excludePipelines;
+  if (setup.hw == 'rk3588' && !fs.existsSync('/dev/hdmirx')) {
+    excludePipelines = 'h265_hdmi';
+  }
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + `/${setup.hw}/`, excludePipelines));
+
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/generic/'));
+
+  for (const p in ps) {
+    const props = pipelineGetAudioProps(ps[p].path)
+    Object.assign(ps[p], props);
+  }
+
+  return ps;
+}
+const pipelines = getPipelines();
+
+function searchPipelines(id) {
+  if (pipelines[id]) return pipelines[id];
+  return null;
+}
+
+// pipeline list in the format needed by the frontend
+function getPipelineList() {
+  const list = {};
+  for (const id in pipelines) {
+    list[id] = {name: pipelines[id].name, asrc: pipelines[id].asrc, acodec: pipelines[id].acodec};
+  }
+  return list;
+}
 
 
 /*
@@ -2100,7 +3419,7 @@ function asrcProbe(asrc) {
   audioSrcId = audioDevices[asrc];
   if (!audioSrcId) {
     const msg = `Selected audio input '${config.asrc}' is unavailable. Waiting for it before starting the stream...`;
-    notificationBroadcast('asrc_not_found', 'warning', msg, 2, true, false);
+    notificationBroadcast('asrc_not_found', 'error', msg, 2, true, false);
   }
 
   return audioSrcId;
@@ -2115,13 +3434,13 @@ async function pipelineSetAsrc(pipelineFile, audioSrcId, audioCodec) {
 }
 
 let asrcRetryTimer;
-function asrcScheduleRetry(pipelineFile, callback, conn) {
+function asrcScheduleRetry(callback, pipelineFile, srtlaAddr, srtlaPort, streamid) {
   asrcRetryTimer = setTimeout(function() {
-    asrcRetry(pipelineFile, callback, conn);
+    asrcRetry(callback, pipelineFile, srtlaAddr, srtlaPort, streamid);
   }, 1000);
 }
 
-async function asrcRetry(pipelineFile, callback, conn) {
+async function asrcRetry(callback, pipelineFile, srtlaAddr, srtlaPort, streamid) {
   asrcRetryTimer = undefined;
 
   audioSrcId = asrcProbe(config.asrc);
@@ -2129,13 +3448,16 @@ async function asrcRetry(pipelineFile, callback, conn) {
     pipelineFile = await pipelineSetAsrc(pipelineFile, audioSrcId, config.acodec);
     if (!pipelineFile) return;
 
-    let srtlaAddr = await resolveSrtla(config.srtla_addr, conn);
-    if (!srtlaAddr) return;
-
-    callback(pipelineFile, srtlaAddr);
+    callback(pipelineFile, srtlaAddr, srtlaPort, streamid);
   } else {
-    asrcScheduleRetry(pipelineFile, callback, conn);
+    asrcScheduleRetry(callback, pipelineFile, srtlaAddr, srtlaPort, streamid);
   }
+}
+
+function validatePortNo(port) {
+  const portTmp = parseInt(port);
+  if (portTmp != port || portTmp <= 0 || portTmp > 0xFFFF) return undefined;
+  return portTmp;
 }
 
 async function updateConfig(conn, params, callback) {
@@ -2188,23 +3510,45 @@ async function updateConfig(conn, params, callback) {
     return startError(conn, `invalid SRT latency '${params.srt_latency}' ms`);
   params.srt_latency = latencyTmp;
 
-  // srt streamid
-  if (params.srt_streamid == undefined)
-    return startError(conn, "SRT streamid not specified");
-
   // srtla addr & port
-  if (params.srtla_addr == undefined)
-    return startError(conn, "SRTLA address not specified");
-  params.srtla_addr = params.srtla_addr.trim();
-  if (params.srtla_port == undefined)
-    return startError(conn, "SRTLA port not specified");
-  const portTmp = parseInt(params.srtla_port);
-  if (portTmp != params.srtla_port || portTmp <= 0 || portTmp > 0xFFFF)
-    return startError(conn, `invalid SRTLA port '${params.srtla_port}'`);
-  params.srtla_port = portTmp;
+  let srtlaAddr, srtlaPort;
+  if (relaysCache && params.relay_server) {
+    const relayServer = relaysCache.servers[params.relay_server];
+    if (!relayServer) {
+      return startError(conn, "Invalid relay server specified");
+    }
+    srtlaAddr = relayServer.addr;
+    srtlaPort = relayServer.port;
+  } else {
+    if (params.srtla_addr == undefined)
+      return startError(conn, "SRTLA address not specified");
+    params.srtla_addr = params.srtla_addr.trim();
+    srtlaAddr = params.srtla_addr;
+
+    if (params.srtla_port == undefined)
+      return startError(conn, "SRTLA port not specified");
+    params.srtla_port = validatePortNo(params.srtla_port);
+    if (!params.srtla_port)
+      return startError(conn, `invalid SRTLA port '${params.srtla_port}'`);
+    srtlaPort = params.srtla_port;
+  }
+
+  // srt streamid
+  let streamid;
+  if (relaysCache && params.relay_server && params.relay_account) {
+    const relayAccount = relaysCache.accounts[params.relay_account];
+    if (!relayAccount) {
+      return startError(conn, "Invalid relay account specified!");
+    }
+    streamid = relayAccount.ingest_key;
+  } else {
+    if (params.srt_streamid == undefined)
+      return startError(conn, "SRT streamid not specified");
+    streamid = params.srt_streamid;
+  }
 
   // resolve the srtla hostname
-  let srtlaAddr = await resolveSrtla(params.srtla_addr, conn);
+  srtlaAddr = await resolveSrtla(srtlaAddr, conn);
   if (!srtlaAddr) return;
 
   // audio capture device, if needed for the pipeline
@@ -2234,10 +3578,27 @@ async function updateConfig(conn, params, callback) {
   config.pipeline = params.pipeline;
   config.max_br = params.max_br;
   config.srt_latency = params.srt_latency;
-  config.srt_streamid = params.srt_streamid;
-  config.srtla_addr = params.srtla_addr;
-  config.srtla_port = params.srtla_port;
   config.bitrate_overlay = params.bitrate_overlay;
+  if (params.relay_server) {
+    config.relay_server = params.relay_server;
+    delete config.srtla_addr;
+    delete config.srtla_port;
+  } else {
+    config.srtla_addr = params.srtla_addr;
+    config.srtla_port = params.srtla_port;
+    delete config.relay_server;
+  }
+  if (params.relay_account) {
+    config.relay_account = params.relay_account;
+    delete config.srt_streamid;
+  } else {
+    config.srt_streamid = params.srt_streamid;
+    delete config.relay_account;
+  }
+
+  if (!params.relay_server || !params.relay_account) {
+    convertManualToRemoteRelay();
+  }
 
   saveConfig();
 
@@ -2247,9 +3608,9 @@ async function updateConfig(conn, params, callback) {
     pipelineFile = await pipelineSetAsrc(pipelineFile, audioSrcId, audioCodec);
     if (!pipelineFile) return;
 
-    callback(pipelineFile, srtlaAddr);
+    callback(pipelineFile, srtlaAddr, srtlaPort, streamid);
   } else {
-    asrcScheduleRetry(pipelineFile, callback, conn);
+    asrcScheduleRetry(callback, pipelineFile, srtlaAddr, srtlaPort, streamid);
     updateStatus(true);
   }
 }
@@ -2314,7 +3675,7 @@ function start(conn, params) {
   }
 
   const senderId = conn.senderId;
-  updateConfig(conn, params, function(pipeline, srtlaAddr) {
+  updateConfig(conn, params, function(pipeline, srtlaAddr, srtlaPort, streamid) {
     if (genSrtlaIpList() < 1) {
       startError(conn, "Failed to start, no available network connections", senderId);
       return;
@@ -2324,7 +3685,7 @@ function start(conn, params) {
     spawnStreamingLoop(srtlaSendExec, [
                          9000,
                          srtlaAddr,
-                         config.srtla_port,
+                         srtlaPort,
                          setup.ips_file
                        ], 100, function(err) {
       let msg;
@@ -2346,9 +3707,9 @@ function start(conn, params) {
                             '-b', setup.bitrate_file,
                             '-l', config.srt_latency,
                           ];
-    if (config.srt_streamid != '') {
+    if (streamid != '') {
       belacoderArgs.push('-s');
-      belacoderArgs.push(config.srt_streamid);
+      belacoderArgs.push(streamid);
     }
     spawnStreamingLoop(belacoderExec, belacoderArgs, 2000, function(err) {
       let msg;
@@ -2969,14 +4330,17 @@ function sendStatus(conn) {
                                 updating: softUpdateStatus,
                                 ssh: getSshStatus(conn),
                                 wifi: wifiBuildMsg(),
+                                modems: modemsBuildMsg(),
                                 asrcs: Object.keys(audioDevices)}));
 }
 
-async function sendInitialStatus(conn) {
+function sendInitialStatus(conn) {
   conn.send(buildMsg('config', config));
-  conn.send(buildMsg('pipelines', await getPipelineList()));
+  conn.send(buildMsg('pipelines', getPipelineList()));
+  if (relaysCache)
+    conn.send(buildMsg('relays', buildRelaysMsg()));
   sendStatus(conn);
-  conn.send(buildMsg('netif', netif));
+  conn.send(buildMsg('netif', netIfBuildMsg()));
   conn.send(buildMsg('sensors', sensors));
   conn.send(buildMsg('revisions', revisions));
   conn.send(buildMsg('acodecs', audioCodecs));
@@ -3025,7 +4389,7 @@ function stripPasswords(obj) {
   for (const p in copy) {
     if (p === 'password') {
       copy[p] = '<password not logged>';
-    } else if (copy[p].constructor === Object) {
+    } else if (copy[p] && copy[p].constructor === Object) {
       copy[p] = stripPasswords(copy[p]);
     }
   }
@@ -3085,6 +4449,9 @@ function handleMessage(conn, msg, isRemote = false) {
         break;
       case 'wifi':
         handleWifi(conn, msg[type]);
+        break;
+      case 'modems':
+        handleModems(conn, msg[type]);
         break;
       case 'logout':
         if (conn.authToken) {

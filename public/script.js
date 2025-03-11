@@ -129,10 +129,17 @@ function handleAuthResult(msg) {
     if (msg.auth_token) {
       localStorage.setItem('authToken', msg.auth_token);
     }
+    // Reset state
+    modems = {};
+    wifiIfs = {};
+
+    // Reset the UI
     $('#login').addClass('d-none');
     $('#initialPasswordForm').addClass('d-none');
     hideError();
     $('#notifications').empty();
+    $('#wifi').empty();
+    $('#modemManager').empty();
     $('#main').removeClass('d-none');
     $('#themeSelector').removeClass('d-none');
   } else if (!isShowingInitialPasswordForm) {
@@ -469,6 +476,10 @@ function updateStatus(status) {
     updateWifiState(status.wifi);
   }
 
+  if (status.modems) {
+    updateModemsState(status.modems);
+  }
+
   if (status.asrcs) {
     updateAudioSrcs(status.asrcs);
   }
@@ -484,12 +495,13 @@ function loadConfig(c) {
   initSrtLatencySlider(config.srt_latency ?? 2000);
   updatePipelines(null);
   updateAudioSrcs(null);
+  updateRelays(null);
 
   const srtlaAddr = config.srtla_addr ?? "";
   showHideRelayHint(srtlaAddr);
-  document.getElementById("srtlaAddr").value = srtlaAddr;
-  document.getElementById("srtStreamid").value = config.srt_streamid ?? "";
-  document.getElementById("srtlaPort").value = config.srtla_port ?? "";
+  $('#srtlaAddr').val(srtlaAddr);
+  $('#srtlaPort').val(config.srtla_port ?? "");
+  $('#srtStreamid').val(config.srt_streamid ?? "");
 
   $('#remoteDeviceKey').val(config.remote_key);
   $('#remoteKeyForm button[type=submit]').prop('disabled', true);
@@ -502,30 +514,40 @@ function loadConfig(c) {
 
 
 /* Pipelines */
+function genOptionList(options, selected) {
+  const list = [];
+  for (const o of options) {
+    for (const value in o) {
+      const html = '<option></option>'
+      const entry = $($.parseHTML(html));
+      entry.attr('value', value);
+      entry.text(o[value].name);
+      if (selected && value == selected) {
+        entry.attr('selected', true);
+      }
+      if (o[value].disabled) {
+        entry.attr('disabled', true);
+      }
+      list.push(entry);
+    }
+  }
+  return list;
+}
+
 let pipelines = {};
 function updatePipelines(ps) {
   if (ps != null) {
     pipelines = ps;
   }
 
-  const pipelinesSelect = document.getElementById("pipelines");
-  pipelinesSelect.innerText = null;
+  const list = genOptionList([pipelines], config.pipeline);
+  $('#pipelines').html(list);
 
-  for (const id in pipelines) {
-    const option = document.createElement("option");
-    option.value = id;
-    option.innerText = pipelines[id].name;
-    if (config.pipeline && config.pipeline == id) {
-      option.selected = true;
-    }
-
-    pipelinesSelect.append(option);
-  }
-  pipelineSelectHandler(pipelinesSelect);
+  pipelineSelectHandler($('#pipelines').val())
 }
 
 function pipelineSelectHandler(s) {
-  const p = pipelines[s.value];
+  const p = pipelines[s];
   if (!p) return;
 
   if (p.asrc) {
@@ -542,8 +564,75 @@ function pipelineSelectHandler(s) {
 }
 
 $("#pipelines").change(function(ev) {
-  pipelineSelectHandler(ev.target);
+  pipelineSelectHandler(ev.target.value);
 });
+
+/* Remote relays config */
+let isValidRelaySelection = true;
+function updateRelaySettings() {
+  if ($('#relayServer').val() == 'manual') {
+    $('.remote-relay-account').addClass('d-none');
+    $('.manual-relay-addr, .manual-streamid').removeClass('d-none');
+    isValidRelaySelection = true;
+  } else {
+    $('.manual-relay-addr').addClass('d-none');
+    $('.remote-relay-account').removeClass('d-none');
+    if ($('#relayAccount').val() == 'manual') {
+      $('.manual-streamid').removeClass('d-none');
+    } else {
+      $('.manual-streamid').addClass('d-none');
+    }
+    isValidRelaySelection = ($('#relayAccount').val() !== null);
+  }
+
+  if (isValidRelaySelection) {
+    removeNotification('relay_account_unavailable');
+  } else {
+    showNotification({name: 'relay_account_unavailable', type: 'error',
+                      msg: 'Your selected relay server account is no longer available. ' +
+                           'Please select a different one to start the stream.'});
+  }
+  updateButtonEnabledDisabled();
+}
+$('#relayServer, #relayAccount').change(function() {
+  updateRelaySettings();
+});
+
+let relays;
+function updateRelays(r) {
+  if (r && r.servers && r.accounts) {
+    relays = r;
+  }
+
+  const preset = {manual: {name: 'Manual configuration'}};
+
+  let selectedServer = config.relay_server;
+  if (!relays || config.srtla_addr || config.srtla_port) {
+    selectedServer = 'manual';
+  } else if (!config.relay_server || !relays.servers[config.relay_server]) {
+    for (const s in relays.servers) {
+      if (relays.servers[s].default) {
+        selectedServer = s;
+      }
+    }
+  }
+  const serverList = genOptionList([relays ? relays.servers : {}, preset], selectedServer);
+  $('#relayServer').html(serverList);
+
+  let selectedAccount = config.relay_account;
+  if (!relays || config.srt_streamid !== undefined) {
+    selectedAccount = 'manual';
+  } else if (config.relay_account) {
+    if (!relays.accounts[config.relay_account]) {
+      preset['unavailable'] = {name: 'No longer available', disabled: true};
+      selectedAccount = 'unavailable';
+    }
+  }
+  const accountList = genOptionList([relays ? relays.accounts : {}, preset], selectedAccount);
+  $('#relayAccount').html(accountList);
+
+  updateRelaySettings();
+}
 
 /* Bitrate setting updates */
 function updateBitrate(br) {
@@ -702,7 +791,7 @@ function wifiListAvailableNetwork(device, deviceId, a) {
         <span class="ssid" onClick="wifiConnect(this)"></span>
       </td>
       <td class="text-right px-0">
-        <button class="d-none btn btn-warning px-1 py-0 disconnect btn-sm btn-netact"
+        <button class="d-none btn btn-warning px-1 py-0 disconnect btn-sm netact"
                 onClick="wifiDisconnect(this)" title="Disconnect">
           <span class="font-weight-bold button-icon">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-wifi-off" viewBox="0 0 16 16">
@@ -711,7 +800,7 @@ function wifiListAvailableNetwork(device, deviceId, a) {
           </span>
           <span class="button-text">Disconnect</span>
         </button>
-        <button class="d-none btn btn-danger px-1 py-0 forget btn-sm btn-netact"
+        <button class="d-none btn btn-danger px-1 py-0 forget btn-sm netact"
                 onClick="wifiForget(this)" title="Forget">
           <span class="font-weight-bold button-icon">&#128465;</span>
           <span class="button-text">Forget</span>
@@ -751,7 +840,7 @@ function wifiListSavedNetwork(ssid, uuid) {
     <tr class="network">
       <td class="ssid col-11"></td>
       <td class="col-1">
-        <button class="btn btn-danger px-1 py-0 forget btn-sm btn-netact"
+        <button class="btn btn-danger px-1 py-0 forget btn-sm netact"
                 onClick="wifiForget(this)" title="Forget">
           <span class="font-weight-bold button-icon">&#128465;</span>
           <span class="button-text">Forget</span>
@@ -767,6 +856,47 @@ function wifiListSavedNetwork(ssid, uuid) {
   return network;
 }
 
+function wifiCheckHotspotSettings(deviceId) {
+  if (!wifiIfs[deviceId] || !wifiIfs[deviceId].hotspot) return;
+
+  const cardId = wifiFindCardId(deviceId);
+  const form = $(`#${cardId}`).find('.hotspot');
+
+  let anyValueChanged = false;
+  let allValuesValid = true;
+
+  const nameInput = form.find('.hotspot-name').val();
+  if (nameInput != wifiIfs[deviceId].hotspot.name) {
+    anyValueChanged = true;
+    const hint = form.find('.hotspot-name-hint');
+    if (nameInput.length < 1 || nameInput.length > 32) {
+      hint.removeClass('d-none');
+      allValuesValid = false;
+    } else {
+      hint.addClass('d-none');
+    }
+  }
+
+  const passwordInput = form.find('.hotspot-password').val();
+  if (passwordInput != wifiIfs[deviceId].hotspot.password) {
+    anyValueChanged = true;
+    const hint = form.find('.hotspot-password-hint');
+    if (passwordInput.length < 8 || passwordInput.length > 64) {
+      hint.removeClass('d-none');
+      allValuesValid = false;
+    } else {
+      hint.addClass('d-none');
+    }
+  }
+
+  const channelInput = form.find('.hotspot-channel');
+  if (channelInput.val() != wifiIfs[deviceId].hotspot.channel) {
+    anyValueChanged = true;
+  }
+
+  form.find('.hotspot-config-save').attr('disabled', !anyValueChanged || !allValuesValid)
+}
+
 let wifiIfs = {};
 function updateWifiState(msg) {
   for (const i in wifiIfs) {
@@ -774,8 +904,6 @@ function updateWifiState(msg) {
   }
 
   for (let deviceId in msg) {
-    deviceId = parseInt(deviceId);
-
     // Mark the interface as not removed
     if (wifiIfs[deviceId]) {
       delete wifiIfs[deviceId].removed;
@@ -790,83 +918,180 @@ function updateWifiState(msg) {
         <div id="${cardId}" class="wifi-settings card mb-2">
           <div class="card-header bg-success text-center" type="button" data-toggle="collapse" data-target="#collapseWifi-${deviceId}">
             <button class="btn btn-link text-white" type="button" data-toggle="collapse" data-target="#collapseWifi-${deviceId}" aria-expanded="false" aria-controls="collapseWifi-${deviceId}">
-              Wifi: <strong class="device-name"></strong>
+              Wifi: <strong class="device-name"></strong><span class="device-hw"></span>
             </button>
           </div>
 
           <div class="collapse" id="collapseWifi-${deviceId}">
             <div class="card-body">
-              <button type="button" class="btn btn-block btn-secondary btn-netact mb-2 wifi-scan-button" onClick="wifiScan(this, ${deviceId})">
-                Scan for WiFi networks
-              </button>
+              <div class="hotspot d-none">
+                <p class="hotspot-modified hotspot-warning d-none text-danger">The NetworkManager connection for the hotspot has been modified from the BELABOX defaults. Correct functionality can't be guaranteed. If you experience issues, please delete it via command line</p>
 
-              <div class="connecting small text-info d-none">
-                <div class="spinner-border spinner-border-sm" role="status">
+                <div class="form-group">
+                  <label>Network name</label>
+                  <p class="hotspot-name-hint text-danger d-none">The network name must be between 1 and 32 characters long</p>
+                  <input type="text" class="form-control hotspot-name recheck-netact">
                 </div>
-                Connecting...
-              </div>
 
-              <div class="connect-error small text-info d-none">
-                Error connecting to the network. Has the password changed?
-              </div>
-
-              <div class="scanning small text-info d-none">
-                <div class="spinner-border spinner-border-sm" role="status">
+                <div class="form-group">
+                  <label>Password</label>
+                  <p class="hotspot-password-hint text-danger d-none">The password must be between 8 and 64 characters long</p>
+                  <div class="input-group">
+                    <input type="password" class="form-control hotspot-password netact">
+                    <div class="input-group-append">
+                      <button class="btn btn-outline-secondary showHidePassword" type="button">Show</button>
+                    </div>
+                  </div>
                 </div>
-                Scanning...
-              </div>
 
-              <table class="table mb-2 table-hover table-sm small">
-                <tbody class="networks available-networks"></tbody>
-              </table>
+                <div class="form-group">
+                  <label>Wifi channel</label>
+                  <select class="form-control hotspot-channel netact">
+                  </select>
+                </div>
 
-              <table class="d-none table mt-4 table-hover table-sm small saved-networks">
-                <thead>
-                  <th colspan=2>Other saved networks</th>
-                </thead>
-                <tbody class="networks saved-networks"></tbody>
-              </table>
+                <div class="text-danger form-group save-error small d-none"></div>
+                <div class="text-info form-group saving small d-none"><div class="spinner-border spinner-border-sm"></div> Saving...</div>
+                <div class="text-success form-group saved small d-none">Saved</div>
+
+                <button class="btn btn-block btn-primary mb-2 hotspot-config-save netact" disabled>Save</button>
+                <button class="btn btn-block btn-warning mb-2 client-mode netact">Turn hotspot off</button>
+              </div> <!-- .hotspot -->
+
+              <div class="client d-none">
+                <button type="button" class="btn btn-block btn-secondary btn-netact mb-2 wifi-scan-button" onClick="wifiScan(this, ${deviceId})">
+                  Scan for WiFi networks
+                </button>
+
+                <div class="connecting small text-info d-none">
+                  <div class="spinner-border spinner-border-sm" role="status">
+                  </div>
+                  Connecting...
+                </div>
+
+                <div class="connect-error small text-info d-none">
+                  Error connecting to the network. Has the password changed?
+                </div>
+
+                <div class="scanning small text-info d-none">
+                  <div class="spinner-border spinner-border-sm" role="status">
+                  </div>
+                  Scanning...
+                </div>
+
+                <table class="table mb-2 table-hover table-sm small">
+                  <tbody class="networks available-networks"></tbody>
+                </table>
+
+                <table class="d-none table mt-4 table-hover table-sm small saved-networks">
+                  <thead>
+                    <th colspan=2>Other saved networks</th>
+                  </thead>
+                  <tbody class="networks saved-networks"></tbody>
+                </table>
+
+                <button class="btn btn-block btn-warning mb-2 hotspot-mode netact" disabled>Hotspot mode</button>
+              </div> <!-- .client -->
             </div>
           </div>
         </div>`;
 
       deviceCard = $($.parseHTML(html));
 
+      deviceCard.find('button.showHidePassword').click(showHidePassword);
+
+      deviceCard.find('button.hotspot-mode').click(function() {
+        if (confirm('This will immediately disconnect the WiFi adapter from any connected networks and turn on the hotspot. Proceed?')) {
+          ws.send(JSON.stringify({wifi: {hotspot: {start: {device: deviceId}}}}));
+        }
+      });
+
+      deviceCard.find('button.client-mode').click(function() {
+        if (confirm('This will immediately disconnect any connected clients and disable the hotspot. Proceed?')) {
+          ws.send(JSON.stringify({wifi: {hotspot: {stop: {device: deviceId}}}}));
+        }
+      });
+
+      deviceCard.find('.hotspot-name, .hotspot-password, .hotspot-channel').on('input', function() {wifiCheckHotspotSettings(deviceId)});
+
+      deviceCard.find('button.hotspot-config-save').click(function() {
+        let config = {
+          device: deviceId,
+          name: deviceCard.find('input.hotspot-name').val(),
+          password: deviceCard.find('input.hotspot-password').val(),
+          channel: deviceCard.find('select.hotspot-channel').val(),
+        };
+        ws.send(JSON.stringify({wifi: {hotspot: {config}}}));
+
+        $(this).attr('disabled', true);
+        deviceCard.find('.save-error, .saved').addClass('d-none');
+        deviceCard.find('.saving').removeClass('d-none');
+      });
+
       deviceCard.appendTo('#wifi');
     }
 
     // Update the card's header
     deviceCard.find('.device-name').text(device.ifname);
+    deviceCard.find('.device-hw').text(device.hw ? ` (${device.hw})` : '');
 
-    // Show the available networks
-    let networkList = [];
+    // Disable or enable the hotspot mode button depending on whether the hardware supports it
+    deviceCard.find('button.hotspot-mode').attr('disabled', (!device.supports_hotspot && !device.hotspot));
 
-    for (const a of msg[deviceId].available) {
-      if (a.active) {
-        networkList.push(wifiListAvailableNetwork(device, deviceId, a));
+    if (device.hotspot) {
+      if (!wifiIfs[deviceId] || !wifiIfs[deviceId].hotspot || wifiIfs[deviceId].hotspot.name != device.hotspot.name) {
+        deviceCard.find('.hotspot-name').val(device.hotspot.name);
       }
-    }
-
-    for (const a of msg[deviceId].available) {
-      if (!a.active) {
-        networkList.push(wifiListAvailableNetwork(device, deviceId, a));
+      if (!wifiIfs[deviceId] || !wifiIfs[deviceId].hotspot || wifiIfs[deviceId].hotspot.password != device.hotspot.password) {
+        deviceCard.find('.hotspot-password').val(device.hotspot.password);
       }
-    }
+      if (!wifiIfs[deviceId] || !wifiIfs[deviceId].hotspot || wifiIfs[deviceId].hotspot.channel != device.hotspot.channel) {
+        const channels = genOptionList([device.hotspot.available_channels], device.hotspot.channel);
+        deviceCard.find('select.hotspot-channel').html(channels);
+      }
 
-    deviceCard.find('.available-networks').html(networkList);
+      if (device.hotspot.warnings && device.hotspot.warnings.includes('modified')) {
+        deviceCard.find('.hotspot-modified').removeClass('d-none');
+      } else {
+        deviceCard.find('.hotspot-modified').addClass('d-none');
+      }
 
-    // Show the saved networks
-    networkList = [];
-    for (const ssid in msg[deviceId].saved) {
-      const uuid = msg[deviceId].saved[ssid];
-      networkList.push(wifiListSavedNetwork(ssid, uuid));
-    }
-
-    if (networkList.length) {
-      deviceCard.find('tbody.saved-networks').html(networkList);
-      deviceCard.find('table.saved-networks').removeClass('d-none');
+      deviceCard.find('.client').addClass('d-none');
+      deviceCard.find('.hotspot').removeClass('d-none');
     } else {
-      deviceCard.find('table.saved-networks').addClass('d-none');
+      // Show the available networks
+      let networkList = [];
+
+      for (const a of msg[deviceId].available) {
+        if (a.active) {
+          networkList.push(wifiListAvailableNetwork(device, deviceId, a));
+        }
+      }
+
+      for (const a of msg[deviceId].available) {
+        if (!a.active) {
+          networkList.push(wifiListAvailableNetwork(device, deviceId, a));
+        }
+      }
+
+      deviceCard.find('.available-networks').html(networkList);
+
+      // Show the saved networks
+      networkList = [];
+      for (const ssid in msg[deviceId].saved) {
+        const uuid = msg[deviceId].saved[ssid];
+        networkList.push(wifiListSavedNetwork(ssid, uuid));
+      }
+
+      if (networkList.length) {
+        deviceCard.find('tbody.saved-networks').html(networkList);
+        deviceCard.find('table.saved-networks').removeClass('d-none');
+      } else {
+        deviceCard.find('table.saved-networks').addClass('d-none');
+      }
+
+      deviceCard.find('.hotspot').addClass('d-none');
+      deviceCard.find('.client').removeClass('d-none');
     }
   }
 
@@ -904,6 +1129,300 @@ function handleWifiResult(msg) {
     }
     if (msg.new.success) {
       $('#wifiModal').modal('hide');
+    }
+  } else if (msg.hotspot) {
+    if (msg.hotspot.config) {
+      const wifiManager = $(`#${wifiFindCardId(msg.hotspot.config.device)}`);
+
+      if (msg.hotspot.config.success) {
+        wifiManager.find('.save-error, .saving').addClass('d-none');
+        wifiManager.find('.saved').removeClass('d-none');
+
+      } else if (msg.hotspot.config.error) {
+        let errMsg;
+
+        switch (msg.hotspot.config.error) {
+          case 'name':
+          case 'password':
+          case 'channel':
+            errMsg = `invalid ${msg.hotspot.config.error}`;
+            break;
+          case 'saving':
+          case 'activating':
+            errMsg = 'couldn\'t apply the new settings';
+            break;
+        }
+        if (errMsg) {
+          const errorField = wifiManager.find('.save-error');
+          errorField.text('Failed to save the settings: ' + errMsg);
+          wifiManager.find('.saved, .saving').addClass('d-none');
+          errorField.removeClass('d-none');
+        }
+      }
+    }
+  }
+}
+
+
+/* Modem manager */
+function modemFindCardId(deviceId) {
+  return `modemManager${parseInt(deviceId)}`;
+}
+
+let modems = {};
+function updateModemsState(msg) {
+  for (const i in modems) {
+    modems[i].removed = true;
+  }
+
+  for (let deviceId in msg) {
+    if (modems[deviceId]) {
+      delete modems[deviceId].removed;
+    }
+
+    const cardId = modemFindCardId(deviceId);
+    const device = msg[deviceId];
+    const modem = modems[deviceId];
+
+    let deviceCard = $(`#${cardId}`);
+
+    if (deviceCard.length == 0) {
+      const html = `
+        <div id="${cardId}" class="modem-settings card mb-2">
+          <div class="card-header bg-success text-center" type="button" data-toggle="collapse" data-target="#collapse-${cardId}">
+            <button class="btn btn-link text-white" type="button" data-toggle="collapse" data-target="#collapse-${cardId}" aria-expanded="false" aria-controls="#collapse-${cardId}">
+              Modem: <strong class="device-ifname"></strong><span class="device-name"></span>
+            </button>
+          </div>
+
+          <div class="collapse" id="collapse-${cardId}">
+            <div class="form-group px-3 py-1 mb-2 border-bottom modem-status">
+              <span class="signal d-none"></span>
+              <span class="status d-none"></span>
+              <span class="no-sim text-danger d-none">No SIM card</span>
+            </div>
+            <div class="card-body pt-0 pb-3 d-none">
+              <div class="form-group mb-1">
+                <label class="mb-0" for="networkType-${cardId}">Network type</label>
+                <select class="network-type-input custom-select" id="networkType-${cardId}"></select>
+              </div>
+              <div class="form-group mb-1">
+                <input type="checkbox" class="roaming-input" id="roaming-${cardId}">
+                <label class="mb-0" for="roaming-${cardId}">Allow roaming</label>
+              </div>
+              <div class="form-group mb-1 network-selection-group">
+                <label class="mb-0" for="networkSelection-${cardId}">Network</label>
+                <div class="input-group">
+                  <select class="network-selection-input custom-select" id="networkSelection-${cardId}"></select>
+                  <div class="input-group-append">
+                    <button class="btn btn-outline-primary network-scan-button">Scan</button>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group mb-1 autoconfig-group d-none">
+                <input type="checkbox" class="autoconfig-input" id="autoconfig-${cardId}" disabled>
+                <label class="mb-0" for="autoconfig-${cardId}">Automatic APN configuration</label>
+              </div>
+              <div class="apn-manual-config">
+                <div class="form-group mb-1">
+                  <label class="mb-0" for="apn-${cardId}">APN</label>
+                  <input type="text" class="form-control apn-input" id="apn-${cardId}">
+                </div>
+                <div class="form-group mb-1">
+                  <label class="mb-0" for="username-${cardId}">Username</label>
+                  <input type="text" class="form-control username-input" id="username-${cardId}">
+                </div>
+                <div class="form-group mb-2">
+                  <label class="mb-0" for="password-${cardId}">Password</label>
+                  <input type="text" class="form-control password-input" id="password-${cardId}">
+                </div>
+              </div>
+
+              <button class="btn btn-block btn-primary netact save-button" disabled>Save</button>
+            </div>
+          </div>
+        </div>`;
+
+      deviceCard = $($.parseHTML(html));
+
+      // Set the name
+      if (device.ifname) {
+        deviceCard.find('.device-ifname').text(device.ifname);
+        deviceCard.find('.device-name').text(` (${device.name})`);
+      } else {
+        deviceCard.find('.device-name').text(device.name);
+      }
+
+      // Show the status bar, either with the no SIM message or actual signal info
+      if (device.no_sim) {
+        deviceCard.find('.no-sim').removeClass('d-none');
+      } else {
+        deviceCard.find('.signal, .status, .card-body').removeClass('d-none');
+      }
+
+      // Dynamically show and hide network selection depending on the roaming checkbox
+      const showHideNetworkSelection = function() {
+        const checkbox = $(this);
+        const networkSelection = $(this).parents('.card-body').find('.network-selection-group');
+        if (checkbox.prop('checked')) {
+          networkSelection.removeClass('d-none');
+        } else {
+          networkSelection.addClass('d-none');
+        }
+      };
+      deviceCard.find('.roaming-input').on('change', showHideNetworkSelection);
+
+      // Check if the device supports GSM autoconfiguration
+      if (device.config && device.config.autoconfig !== undefined) {
+        // Dynamically show and hide APN settings depending on the autoconfig checkbox
+        const showHideApnConfig = function() {
+          const checkbox = $(this);
+          const apnConfigForm = $(this).parents('.card-body').find('.apn-manual-config');
+          if (checkbox.prop('checked')) {
+            apnConfigForm.addClass('d-none');
+          } else {
+            apnConfigForm.removeClass('d-none');
+          }
+        };
+        const checkbox = deviceCard.find('.autoconfig-input');
+        checkbox.on('change', showHideApnConfig);
+        checkbox.prop('disabled', false);
+        deviceCard.find('.autoconfig-group').removeClass('d-none');
+      }
+
+      const scanButton = deviceCard.find('.network-scan-button');
+      scanButton.click(function() {
+        if (confirm('Scanning for networks will temporarily disable the data connection of this modem. Proceed?')) {
+          scanButton.prop('disabled', true);
+          scanButton.text('Scanning...');
+          ws.send(JSON.stringify({modems: {scan: {device: deviceId}}}));
+        }
+      });
+
+      const getUserConfig = function(deviceCard) {
+        const network_type = deviceCard.find('.network-type-input').val();
+        const roaming = deviceCard.find('.roaming-input').prop('checked');
+        const network = deviceCard.find('.network-selection-input').val();
+        const autoconfig = deviceCard.find('.autoconfig-input').prop('checked');
+        const apn = deviceCard.find('.apn-input').val();
+        const username = deviceCard.find('.username-input').val();
+        const password = deviceCard.find('.password-input').val();
+
+        return {network_type, roaming, network, autoconfig, apn, username, password};
+      };
+
+      deviceCard.find('.save-button').click(function() {
+        const config = getUserConfig(deviceCard);
+        config.device = deviceId;
+
+        ws.send(JSON.stringify({modems: {config}}));
+
+        $(this).prop('disabled', true);
+      });
+
+      // Disable or enable the save button depending on whether any values have changed
+      const inputs = deviceCard.find('input, select');
+      inputs.on('change, input', function() {
+        if (!modems[deviceId] || !modems[deviceId].config) return false;
+
+        const userConfig = getUserConfig(deviceCard);
+        const savedConfig = Object.assign({network_type: modems[deviceId].network_type.active}, modems[deviceId].config);
+        let changed = false;
+        for (const i in savedConfig) {
+          if (userConfig[i] !== savedConfig[i]) {
+            console.log(`${i} changed`);
+            changed = true;
+            break;
+          }
+        }
+        deviceCard.find('.save-button').prop('disabled', !changed);
+      });
+
+      deviceCard.appendTo('#modemManager');
+    }
+
+    // The following settings may be updated for an existing modem
+    if (device.network_type) {
+      const options = {};
+      for (const i in device.network_type.supported) {
+        const value = device.network_type.supported[i];
+        const name = value.replace(/g/g, 'G / ').replace(/ \/ $/, '');
+        options[value] = {name};
+      }
+      deviceCard.find('.network-type-input').html(genOptionList([options], device.network_type.active));
+    }
+
+    if (device.config) {
+      deviceCard.find('.apn-input').attr('value', device.config.apn);
+      deviceCard.find('.username-input').attr('value', device.config.username);
+      deviceCard.find('.password-input').attr('value', device.config.password);
+      deviceCard.find('.roaming-input').attr('checked', device.config.roaming);
+
+      // Trigger UI updates
+      if (device.config.autoconfig !== undefined) {
+        deviceCard.find('.autoconfig-input').attr('checked', device.config.autoconfig);
+        deviceCard.find('.autoconfig-input').trigger('change');
+      }
+      deviceCard.find('.roaming-input').trigger('change');
+    }
+
+    if (device.status) {
+      deviceCard.find('.signal').html(wifiSignalSymbol(device.status.signal));
+      const statusText = `${device.status.signal}% ${device.status.network_type || ''} `+
+                         `${device.status.network || ''}${device.status.roaming ? ' (R)': ''} - ${device.status.connection}`
+      deviceCard.find('.status').text(statusText);
+    }
+
+    const networkSelect = deviceCard.find('.network-selection-input');
+    if (device.available_networks || device.config || networkSelect.find('option').length == 0) {
+        const selectedNetwork = (device.config ? device.config.network : ((modem && modem.config) ? modem.config.network : undefined));
+        const availableNetworks = device.available_networks || (modem ? modem.available_networks : {});
+        const auto = {'': {name: 'Automatic' + ((selectedNetwork == '') ? ' (selected)' : '')}};
+        const options = {};
+        for (const i in availableNetworks) {
+          let name = availableNetworks[i].name;
+          let availability = '';
+          if (i == selectedNetwork) {
+            availability = 'selected';
+          }
+          if (availableNetworks[i].availability) {
+            if (availability) {
+              availability += ' & ';
+            }
+            availability += availableNetworks[i].availability;
+          }
+          if (availability) {
+            name += ` (${availability})`
+          }
+          options[i] = {
+            name,
+            disabled: (availableNetworks[i].availability == 'forbidden')
+          };
+        }
+        networkSelect.html(genOptionList([auto, options], selectedNetwork));
+
+        // Re-enable the scan button after receiving the results
+        if (device.available_networks) {
+          const scanButton = deviceCard.find('.network-scan-button');
+          scanButton.prop('disabled', false);
+          scanButton.text('Scan');
+        }
+    }
+
+    // Update the cached modem state
+    modems[deviceId] = Object.assign(modem || {}, device);
+
+    // Disable or enable the save button if any settings have been updated
+    if (device.network_type || device.config) {
+      deviceCard.find('.network-type-input').trigger('input');
+    }
+  }
+
+  for (const i in modems) {
+    if (modems[i].removed) {
+      const cardId = modemFindCardId(i);
+      $(`#${cardId}`).remove();
+      delete modems[i];
     }
   }
 }
@@ -1041,6 +1560,9 @@ function handleMessage(msg) {
       case 'pipelines':
         updatePipelines(msg[type]);
         break;
+      case 'relays':
+        updateRelays(msg[type]);
+        break;
       case 'bitrate':
         updateBitrate(msg[type]);
         break;
@@ -1078,11 +1600,23 @@ function getConfig() {
   }
   config.delay = $("#delaySlider").slider("value");
   config.max_br = maxBr;
-  config.srtla_addr = document.getElementById("srtlaAddr").value;
-  config.srtla_port = document.getElementById("srtlaPort").value;
-  config.srt_streamid = document.getElementById("srtStreamid").value;
   config.srt_latency = $("#srtLatencySlider").slider("value");
   config.bitrate_overlay = $("#bitrateOverlay").prop('checked');
+
+  const relayServer = $('#relayServer').val();
+  if (relayServer !== 'manual') {
+    config.relay_server = relayServer;
+  } else {
+    config.srtla_addr = $("#srtlaAddr").val();
+    config.srtla_port = $("#srtlaPort").val();
+  }
+
+  const relayAccount = $('#relayAccount').val();
+  if (relayServer !== 'manual' && relayAccount !== 'manual') {
+    config.relay_account = relayAccount;
+  } else {
+    config.srt_streamid = $("#srtStreamid").val();
+  }
 
   return config;
 }
@@ -1103,6 +1637,15 @@ async function send_command(cmd) {
 
 
 /* UI */
+let startStopButtonIsEnabled;
+function updateButtonEnabledDisabled(isEnabled) {
+  if (isEnabled !== undefined) {
+    startStopButtonIsEnabled = isEnabled;
+  }
+  const button = $("#startStop");
+  button.attr('disabled', !startStopButtonIsEnabled || !isValidRelaySelection);
+}
+
 function updateButton({ add, remove, text, enabled }) {
   const button = document.getElementById("startStop");
 
@@ -1110,11 +1653,7 @@ function updateButton({ add, remove, text, enabled }) {
   button.classList.remove(remove);
 
   button.innerHTML = text;
-  if (enabled) {
-    button.removeAttribute("disabled");
-  } else {
-    button.setAttribute("disabled", true);
-  }
+  updateButtonEnabledDisabled(enabled);
 }
 
 function updateButtonAndSettingsShow({ add, remove, text, enabled, settingsShow }) {
@@ -1201,22 +1740,22 @@ function initSrtLatencySlider(defaultLatency) {
 /* UI event handlers */
 document.getElementById("startStop").addEventListener("click", () => {
   if (!isStreaming) {
-    updateButton({text: "Starting..."});
+    updateButton({text: "Starting...", enabled: false});
     start();
   } else {
-    updateButton({text: "Stopping..."});
+    updateButton({text: "Stopping...", enabled: false});
     stop();
   }
 });
 
 function updateNetact(isActive) {
   if (isActive) {
-    $('.btn-netact').attr('disabled', false);
-    checkRemoteKey();
-    $('.set-password').trigger('input');
+    $('.netact, .recheck-netact').attr('disabled', false);
+    $('.recheck-netact').trigger('input');
     showSoftwareUpdates(false);
   } else {
-    $('.btn-netact').attr('disabled', true);
+    $('.netact, .recheck-netact').attr('disabled', true);
+    updateButtonEnabledDisabled(false);
   }
 }
 
@@ -1323,7 +1862,7 @@ $('.command-btn').click(function() {
   }
 });
 
-$('button.showHidePassword').click(function() {
+function showHidePassword() {
   const inputField = $(this).parents('.input-group').find('input');
   if(inputField.attr('type') == 'password') {
     inputField.attr('type', 'text');
@@ -1332,7 +1871,8 @@ $('button.showHidePassword').click(function() {
     inputField.attr('type', 'password');
     $(this).text('Show');
   }
-});
+}
+$('button.showHidePassword').click(showHidePassword);
 
 function showHideRelayHint(addr) {
   const isCloudRelay = addr.match(/belabox.net$/);
